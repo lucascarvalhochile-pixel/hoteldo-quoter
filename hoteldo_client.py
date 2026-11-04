@@ -1,4 +1,4 @@
-"""
+""" 
 Cliente de automacao HotelDo via Playwright.
 
 O HotelDo (ag00124871-hoteldo.e-agencias.com) eh construido sobre a infraestrutura
@@ -91,6 +91,12 @@ class HotelDoClient:
 
         self._browser = await self._playwright.chromium.launch(
             headless=settings.headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
         )
         self._context = await self._browser.new_context(
             storage_state=str(state_file) if state_file.exists() else None,
@@ -162,12 +168,17 @@ class HotelDoClient:
         """
         Autentica no portal HotelDo.
 
-        Fluxo:
-        1. Navegar para o portal
-        2. Detectar se esta na pagina de login ou ja logado
-        3. Se na pagina de login: preencher email/senha, submeter
-        4. Aguardar redirecionamento para dashboard
-        5. Salvar estado (cookies de sessao)
+        Fluxo real (descoberto em nov/2026):
+        1. Navegar para https://pt-hoteldo.e-agencias.com/login/signin
+           (o dominio da agencia redireciona para pt-hoteldo.e-agencias.com)
+        2. A pagina /login/signin tem:
+           - input type="text" placeholder="meunome@exemplo.com" (email)
+           - reCAPTCHA v2 checkbox
+           - link "Seguinte" (nao botao)
+        3. Preencher email, resolver reCAPTCHA (ou esperar auto-pass), clicar Seguinte
+        4. Pagina de senha aparece — preencher e submeter
+        5. Aguardar redirecionamento para dashboard
+        6. Salvar estado (cookies de sessao)
         """
         async with self._login_lock:
             if self._authenticated:
@@ -181,69 +192,139 @@ class HotelDoClient:
             logger.info("Iniciando login no HotelDo para %s", settings.hoteldo_email)
 
             try:
-                # 1. Navegar para o portal
+                # 1. Tentar restaurar sessao existente primeiro
                 await self._page.goto(
                     settings.hoteldo_base_url,
                     wait_until="domcontentloaded",
                     timeout=settings.navigation_timeout_ms,
                 )
-
-                # 2. Aguardar Angular SPA carregar (ate 15s)
                 await self._page.wait_for_timeout(3000)
 
-                # 3. Verificar se ja esta logado (estado salvo restaurou sessao)
                 current_url = self._page.url
                 if "/login" not in current_url and "/auth" not in current_url:
-                    # Pode ja estar logado — verificar com API
                     if await self._check_session_valid():
                         logger.info("Sessao restaurada de estado salvo")
                         self._authenticated = True
                         return
 
-                # 4. Preencher formulario de login
-                logger.info("Preenchendo formulario de login...")
+                # 2. Navegar direto para o formulario de signin
+                logger.info("Navegando para pagina de login...")
+                await self._page.goto(
+                    settings.hoteldo_login_url,
+                    wait_until="domcontentloaded",
+                    timeout=settings.navigation_timeout_ms,
+                )
+                await self._page.wait_for_timeout(3000)
 
-                # Aguardar campo de email (varios seletores possiveis)
+                # Remover flag de automacao do navigator.webdriver
+                await self._page.evaluate("""
+                    () => {
+                        Object.defineProperty(navigator, 'webdriver', {
+                            get: () => undefined
+                        });
+                    }
+                """)
+
+                # 3. Preencher email
+                logger.info("Preenchendo email...")
                 email_sel = (
-                    'input[type="email"], '
-                    'input[name="email"], '
-                    'input[name="username"], '
+                    'input[placeholder*="exemplo"], '
                     'input[placeholder*="mail"], '
-                    'input[placeholder*="uario"]'
+                    'input[type="text"][placeholder]'
                 )
                 await self._page.wait_for_selector(
                     email_sel, state="visible", timeout=15000
                 )
                 email_input = self._page.locator(email_sel).first
+                # Simular digitacao humana
+                await email_input.click()
+                await self._page.wait_for_timeout(500)
                 await email_input.fill(settings.hoteldo_email)
+                await self._page.wait_for_timeout(1000)
 
-                # Preencher senha
+                # 4. Tentar lidar com reCAPTCHA
+                logger.info("Verificando reCAPTCHA...")
+                try:
+                    recaptcha_frame = self._page.frame_locator(
+                        'iframe[src*="recaptcha"]'
+                    )
+                    checkbox = recaptcha_frame.locator(
+                        '#recaptcha-anchor, .recaptcha-checkbox-border'
+                    )
+                    if await checkbox.count() > 0:
+                        logger.info("reCAPTCHA encontrado, tentando clicar...")
+                        await checkbox.first.click()
+                        # Esperar resposta do reCAPTCHA (pode auto-resolver)
+                        await self._page.wait_for_timeout(5000)
+                    else:
+                        logger.info("reCAPTCHA checkbox nao encontrado, continuando...")
+                except Exception as e:
+                    logger.warning("reCAPTCHA handling falhou: %s — continuando", e)
+
+                # 5. Clicar "Seguinte" (eh um link <a>, nao um button)
+                logger.info("Clicando Seguinte...")
+                next_sel = (
+                    'a:has-text("Seguinte"), '
+                    'a:has-text("Siguiente"), '
+                    'a:has-text("Next"), '
+                    'button:has-text("Seguinte"), '
+                    '[class*="next"], [class*="submit"]'
+                )
+                await self._page.locator(next_sel).first.click()
+                await self._page.wait_for_timeout(3000)
+
+                # 6. Verificar se chegou na pagina de senha
+                logger.info("Aguardando pagina de senha...")
+                current_url = self._page.url
+                logger.info("URL apos Seguinte: %s", current_url)
+
+                # Tentar encontrar campo de senha (pode ser na mesma pagina ou nova)
                 password_sel = 'input[type="password"]'
-                await self._page.wait_for_selector(
-                    password_sel, state="visible", timeout=5000
-                )
-                await self._page.locator(password_sel).first.fill(
-                    settings.hoteldo_password
-                )
+                try:
+                    await self._page.wait_for_selector(
+                        password_sel, state="visible", timeout=15000
+                    )
+                    logger.info("Campo de senha encontrado, preenchendo...")
+                    await self._page.locator(password_sel).first.click()
+                    await self._page.wait_for_timeout(300)
+                    await self._page.locator(password_sel).first.fill(
+                        settings.hoteldo_password
+                    )
+                    await self._page.wait_for_timeout(500)
 
-                # Submeter formulario
-                submit_sel = (
-                    'button[type="submit"], '
-                    'input[type="submit"], '
-                    'button:has-text("Entrar"), '
-                    'button:has-text("Ingresar"), '
-                    'button:has-text("Login"), '
-                    'button:has-text("Iniciar")'
-                )
-                await self._page.locator(submit_sel).first.click()
+                    # Submeter formulario de senha
+                    submit_sel = (
+                        'button[type="submit"], '
+                        'input[type="submit"], '
+                        'a:has-text("Entrar"), '
+                        'a:has-text("Ingresar"), '
+                        'button:has-text("Entrar"), '
+                        'button:has-text("Ingresar"), '
+                        'button:has-text("Login"), '
+                        'button:has-text("Iniciar"), '
+                        'a:has-text("Iniciar")'
+                    )
+                    await self._page.locator(submit_sel).first.click()
+                except Exception:
+                    # Pode ser que reCAPTCHA bloqueou e nao avancou
+                    page_text = await self._page.evaluate(
+                        "() => document.body?.innerText?.substring(0, 500) || ''"
+                    )
+                    logger.error(
+                        "Nao encontrou campo de senha. URL: %s, Texto: %s",
+                        self._page.url, page_text[:200]
+                    )
+                    raise HotelDoAuthError(
+                        f"Login travou na etapa de senha — provavelmente reCAPTCHA bloqueou. "
+                        f"URL: {self._page.url}"
+                    )
 
-                # 5. Aguardar navegacao pos-login (sair da pagina de login)
+                # 7. Aguardar navegacao pos-login
                 await self._page.wait_for_timeout(5000)
 
-                # 6. Verificar se login foi bem-sucedido
+                # 8. Verificar se login foi bem-sucedido
                 post_url = self._page.url
                 if "/login" in post_url or "/auth" in post_url:
-                    # Verificar se ha mensagem de erro
                     error_text = await self._page.evaluate("""
                         () => {
                             const el = document.querySelector(
@@ -254,10 +335,10 @@ class HotelDoClient:
                     """)
                     raise HotelDoAuthError(
                         f"Login falhou — ainda na pagina de login. "
-                        f"Erro: {error_text or 'nenhum detectado'}"
+                        f"URL: {post_url}. Erro: {error_text or 'nenhum detectado'}"
                     )
 
-                # 7. Salvar estado
+                # 9. Salvar estado
                 await self._save_state()
                 self._authenticated = True
                 logger.info("Login realizado com sucesso (URL: %s)", post_url)

@@ -1,4 +1,4 @@
-"""
+""" 
 Configuracao centralizada do hoteldo-quoter.
 Todas as variaveis vem de environment variables para deploy seguro no Railway.
 """
@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     # --- HotelDo Portal ---
     hoteldo_base_url: str = "https://ag00124871-hoteldo.e-agencias.com"
+    hoteldo_login_url: str = "https://pt-hoteldo.e-agencias.com/login/signin"
     hoteldo_email: str = ""
     hoteldo_password: str = ""
     hoteldo_agency_id: str = "AG00124871"
