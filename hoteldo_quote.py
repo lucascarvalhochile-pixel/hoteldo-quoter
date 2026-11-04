@@ -317,11 +317,13 @@ class QuoteMixin:
             client_phone=client_data.get("phone", ""),
             client_email=client_data.get("email", ""),
         )
+        details = await self._scrape_quotation_details(q["quote_url"])
         return {
             "product": "flight",
             "quote_id": trip_id,
             "quote_url": q["quote_url"],
             "search_url": url,
+            "details": details,
             "flights": self._safe_parse_flights(search_data),
             "status": "created",
         }
@@ -449,10 +451,41 @@ class QuoteMixin:
 
         self._page.on("response", _on_resp)
         summary: dict[str, Any] = {}
+        hotels: list[dict[str, Any]] = []
+        region_pick: Optional[dict[str, Any]] = None
+        region_applied = False
         try:
             await self._page.goto(url, wait_until="domcontentloaded")
             await self._wait_trip_id_in_url(90)
             summary = await self._scrape_package_summary()
+            hotels = self._parse_availability_results(avail) if avail else []
+
+            # REGRA DO LUCAS (04/11): em destinos com regiao preferida (Santiago:
+            # Providencia / Las Condes / Centro), o hotel do pacote tem que cair
+            # dentro do poligono. Se o recomendado pelo planner ja esta na regiao,
+            # mantem; senao troca pelo melhor da regiao (clicando "Ver detalhe"
+            # no card, o que muda a hospedagem do pacote).
+            from regions import has_preferred_regions, pick_preferred_hotel, region_of
+            if has_preferred_regions(dest_cit) and hotels:
+                current_name = (summary.get("hotel_name") or "").strip().lower()
+                current = next((h for h in hotels if h.get("name", "").strip().lower() == current_name), None)
+                if current and region_of(dest_cit, current.get("latitude"), current.get("longitude")):
+                    current["region"] = region_of(dest_cit, current.get("latitude"), current.get("longitude"))
+                    logger.info("Regiao: hotel recomendado '%s' ja esta em %s", current.get("name"), current["region"])
+                    region_applied = True
+                else:
+                    region_pick = pick_preferred_hotel(dest_cit, hotels)
+                    if region_pick:
+                        logger.info("Regiao: trocando '%s' por '%s' (%s, R$ %s)",
+                                    summary.get("hotel_name"), region_pick.get("name"),
+                                    region_pick.get("region"), region_pick.get("total_price"))
+                        region_applied = await self._select_hotel_card(region_pick["name"])
+                        if region_applied:
+                            summary = {**summary, **(await self._scrape_package_summary(detail_page=True))}
+                            summary["hotel_name"] = region_pick["name"]
+                    else:
+                        logger.info("Regiao: nenhum hotel da lista cai na regiao preferida, mantendo recomendado")
+
             trip_id = await self._click_comprar_and_reach_checkout()
         finally:
             self._page.remove_listener("response", _on_resp)
@@ -463,7 +496,6 @@ class QuoteMixin:
             client_phone=client_data.get("phone", ""),
             client_email=client_data.get("email", ""),
         )
-        hotels = self._parse_availability_results(avail) if avail else []
         # O hotel que esta NO pacote eh o "Hospedagem selecionada" do planner,
         # nao o mais barato da lista
         selected = None
@@ -474,6 +506,7 @@ class QuoteMixin:
                     break
             if not selected:
                 selected = {"name": summary["hotel_name"], "stars": summary.get("stars") or 0}
+        details = await self._scrape_quotation_details(q["quote_url"])
         return {
             "product": "package",
             "quote_id": trip_id,
@@ -482,10 +515,164 @@ class QuoteMixin:
             "hotels": hotels,
             "selected_hotel": selected,
             "summary": summary,
+            "details": details,
+            "region_applied": region_applied,
             "status": "created",
         }
 
-    async def _scrape_package_summary(self) -> dict[str, Any]:
+    async def _select_hotel_card(self, hotel_name: str) -> bool:
+        """
+        Na lista de hospedagens do pacote, clica "Ver detalhe" do card do hotel
+        (isso troca a hospedagem selecionada do pacote) e espera a pagina de
+        detalhe dentro do fluxo (/trip/accommodations/detail/).
+        """
+        target = hotel_name.strip().lower()
+        try:
+            await self._page.wait_for_selector('button:has-text("Ver detalhe")', timeout=30000)
+            # Lista pode ter lazy-load: rola ate o fim algumas vezes
+            for _ in range(6):
+                found = await self._page.evaluate(
+                    """(name) => {
+                        const btns = [...document.querySelectorAll('button')].filter(b => /Ver detalhe/i.test(b.innerText));
+                        for (const b of btns) {
+                            let c = b;
+                            for (let k = 0; k < 8 && c; k++) { c = c.parentElement; if (c && c.innerText.length > 150) break; }
+                            if (c && c.innerText.toLowerCase().includes(name)) { b.scrollIntoView({block:'center'}); return true; }
+                        }
+                        return false;
+                    }""",
+                    target,
+                )
+                if found:
+                    break
+                await self._page.evaluate("window.scrollBy(0, 2500)")
+                await self._page.wait_for_timeout(1500)
+            if not found:
+                logger.info("Regiao: card de '%s' nao encontrado na lista", hotel_name)
+                return False
+            await self._page.evaluate(
+                """(name) => {
+                    const btns = [...document.querySelectorAll('button')].filter(b => /Ver detalhe/i.test(b.innerText));
+                    for (const b of btns) {
+                        let c = b;
+                        for (let k = 0; k < 8 && c; k++) { c = c.parentElement; if (c && c.innerText.length > 150) break; }
+                        if (c && c.innerText.toLowerCase().includes(name)) { b.click(); return; }
+                    }
+                }""",
+                target,
+            )
+            for _ in range(40):
+                await self._page.wait_for_timeout(1000)
+                if "/trip/accommodations/detail/" in self._page.url:
+                    break
+            await self._page.wait_for_selector('a:has-text("Comprar"), button:has-text("Comprar")', timeout=60000)
+            await self._page.wait_for_timeout(1500)
+            ok = await self._page.evaluate(
+                "(name) => (document.body.innerText || '').toLowerCase().includes(name)", target
+            )
+            logger.info("Regiao: detalhe de '%s' aberto (%s)", hotel_name, self._page.url[:100])
+            return bool(ok)
+        except Exception as exc:
+            logger.warning("Regiao: falha ao selecionar '%s': %s", hotel_name, exc)
+            return False
+
+    async def _scrape_quotation_details(self, quote_url: str) -> dict[str, Any]:
+        """
+        Abre a pagina PUBLICA da cotacao, expande os "Ver detalhe" e le cia aerea,
+        numero do voo, aeroportos (codigo + cidade + nome) e bagagem de cada trecho.
+        Best-effort: qualquer falha devolve {}.
+        """
+        try:
+            await self._page.goto(quote_url, wait_until="domcontentloaded")
+            await self._page.wait_for_selector('button:has-text("Ver detalhe")', timeout=30000)
+            for _ in range(6):
+                btns = self._page.locator('button:has-text("Ver detalhe")')
+                n = await btns.count()
+                if not n:
+                    break
+                try:
+                    await btns.first.click(timeout=5000)
+                except Exception:
+                    break
+                await self._page.wait_for_timeout(600)
+            txt = await self._page.evaluate("() => document.body.innerText || ''")
+            return self._parse_quotation_text(txt)
+        except Exception as exc:
+            logger.warning("Nao consegui ler detalhes da cotacao publica: %s", exc)
+            return {}
+
+    @staticmethod
+    def _parse_quotation_text(txt: str) -> dict[str, Any]:
+        import re as _re
+
+        out: dict[str, Any] = {"flights": []}
+        m = _re.search(r"R\$\s*\n?\s*([\d\.]+)", txt)
+        if m:
+            out["total_text"] = m.group(1)
+
+        def _section(start_label: str, end_labels: list[str]) -> str:
+            i = txt.find(start_label)
+            if i < 0:
+                return ""
+            end = len(txt)
+            for e in end_labels:
+                j = txt.find(e, i + len(start_label))
+                if 0 <= j < end:
+                    end = j
+            return txt[i:end]
+
+        for label, key in (("\nIda\n", "out"), ("\nVolta\n", "back")):
+            sec = _section(label, ["\nVolta\n", "\nAcomoda", "Valores referentes"]) if key == "out" \
+                else _section(label, ["\nAcomoda", "Valores referentes"])
+            if not sec:
+                continue
+            f: dict[str, Any] = {"leg": key}
+            mm = _re.search(r"([A-Z]{3})\n(\d\d:\d\d)\n([A-Z]{3})\n(\d\d:\d\d)\n([^\n]+)\n(\d+ h \d+ m)", sec)
+            if mm:
+                f.update(from_code=mm.group(1), dep=mm.group(2), to_code=mm.group(3), arr=mm.group(4),
+                         stops=mm.group(5).strip(), duration=mm.group(6))
+            mm = _re.search(r"Ocultar detalhe\n([^\n]+)\nVoo N[°º]\s*([A-Z0-9]+)", sec)
+            if mm:
+                f["airline"] = mm.group(1).strip()
+                f["flight_number"] = mm.group(2).strip()
+            mm = _re.search(r"Classe:\s*([^\n]+)", sec)
+            if mm:
+                f["cabin"] = mm.group(1).strip()
+            # GRU \n Sao Paulo \n Duracao \n 4 h 29 m \n SCL \n Santiago \n Aeroporto X \n Aeroporto Y
+            mm = _re.search(
+                r"([A-Z]{3})\n([^\n]+)\nDura[cç][aã]o\n[^\n]+\n([A-Z]{3})\n([^\n]+)\n([^\n]*Aeroporto[^\n]*)\n([^\n]*Aeroporto[^\n]*)",
+                sec,
+            )
+            if mm:
+                f.update(from_city=mm.group(2).strip(), to_city=mm.group(4).strip(),
+                         from_airport=mm.group(5).strip(), to_airport=mm.group(6).strip())
+            else:
+                mm = _re.search(r"([A-Z]{3})\n([^\n]+)\nDura[cç][aã]o\n[^\n]+\n([A-Z]{3})\n([^\n]+)", sec)
+                if mm:
+                    f.update(from_city=mm.group(2).strip(), to_city=mm.group(4).strip())
+            bi = sec.find("Bagagem")
+            if bi >= 0:
+                bsec = sec[bi:bi + 600]
+                lines = [l.strip() for l in bsec.split("\n") if l.strip()]
+                f["baggage_lines"] = lines[1:8]
+                low = bsec.lower()
+                f["baggage"] = {
+                    "backpack": "inclui uma mochila" in low or "inclui mochila" in low,
+                    "hand": ("inclui bagagem de m" in low) and ("não inclui bagagem de m" not in low and "nao inclui bagagem de m" not in low),
+                    "checked": ("inclui bagagem para despachar" in low or "inclui bagagem despach" in low)
+                               and ("não inclui bagagem para despachar" not in low and "nao inclui bagagem para despachar" not in low),
+                }
+            out["flights"].append(f)
+        hi = txt.find("Acomoda")
+        if hi >= 0:
+            hsec = txt[hi:hi + 400].split("\n")
+            hsec = [l.strip() for l in hsec if l.strip()]
+            if len(hsec) >= 3:
+                out["hotel_name"] = hsec[1]
+                out["hotel_address"] = hsec[2]
+        return out
+
+    async def _scrape_package_summary(self, detail_page: bool = False) -> dict[str, Any]:
         """Le do planner o hotel selecionado e o preco final do pacote (best-effort)."""
         try:
             await self._page.wait_for_selector('text=/Comprar/', timeout=60000)
@@ -495,6 +682,7 @@ class QuoteMixin:
                     const txt = document.body.innerText || '';
                     const out = {};
                     let m = txt.match(/Hospedagem selecionada\s*\n\s*([^\n]+)/);
+                    if (!m) m = txt.match(/Hospedagem\s*\n\s*Alterar hospedagem\s*\n\s*([^\n]+)/);
                     if (m) out.hotel_name = m[1].trim();
                     m = txt.match(/Pre[cç]o final por pessoa\s*\n?\s*(?:\(i\)\s*)?R\$\s*([\d\.]+)/);
                     if (m) out.price_per_person = m[1];

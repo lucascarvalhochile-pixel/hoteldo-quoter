@@ -809,6 +809,12 @@ class HotelDoClient(TokenAuthMixin, QuoteMixin):
             discount = str(promo["items"][0].get("value") or "").strip()
 
         loc = acc.get("location") or {}
+        coords = loc.get("coordinates") or {}
+        try:
+            latitude = float(coords.get("latitude")) if coords.get("latitude") not in (None, "") else None
+            longitude = float(coords.get("longitude")) if coords.get("longitude") not in (None, "") else None
+        except (TypeError, ValueError):
+            latitude = longitude = None
         address = loc.get("address") or raw.get("address") or ""
         zone = (loc.get("zone") or {}).get("name") or ""
         city = (loc.get("city") or {}).get("name") or ""
@@ -853,6 +859,9 @@ class HotelDoClient(TokenAuthMixin, QuoteMixin):
             "room_pack_id": str(raw.get("room_pack_id") or ""),
             "address": address,
             "zone": zone,
+            "latitude": latitude,
+            "longitude": longitude,
+            "distance": loc.get("distance") or "",
             "city": city,
             "review_score": review_score,
             "review_count": reviews.get("total") or 0,

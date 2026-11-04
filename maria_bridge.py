@@ -497,38 +497,127 @@ class MariaBridge:
             )
         return f"Pra montar a passagem pra *{dest_name}*, de qual cidade voce sai?"
 
+    # Nome da cidade por codigo IATA (fallback quando a pagina da cotacao nao traz)
+    _IATA_CITY = {
+        "GRU": "Sao Paulo (Guarulhos)", "CGH": "Sao Paulo (Congonhas)", "VCP": "Campinas (Viracopos)",
+        "GIG": "Rio de Janeiro (Galeao)", "SDU": "Rio de Janeiro (Santos Dumont)", "CNF": "Belo Horizonte (Confins)",
+        "BSB": "Brasilia", "CWB": "Curitiba", "POA": "Porto Alegre", "FLN": "Florianopolis", "NVT": "Navegantes",
+        "SSA": "Salvador", "REC": "Recife", "FOR": "Fortaleza", "NAT": "Natal", "MCZ": "Maceio", "JPA": "Joao Pessoa",
+        "AJU": "Aracaju", "BEL": "Belem", "MAO": "Manaus", "SLZ": "Sao Luis", "THE": "Teresina", "GYN": "Goiania",
+        "CGB": "Cuiaba", "CGR": "Campo Grande", "VIX": "Vitoria", "LDB": "Londrina", "MGF": "Maringa",
+        "RAO": "Ribeirao Preto", "UDI": "Uberlandia", "IGU": "Foz do Iguacu", "BPS": "Porto Seguro",
+        "SCL": "Santiago", "BOG": "Bogota", "CTG": "Cartagena", "MDE": "Medellin", "ADZ": "San Andres",
+        "LIM": "Lima", "CUZ": "Cusco", "EZE": "Buenos Aires (Ezeiza)", "AEP": "Buenos Aires (Aeroparque)",
+        "BRC": "Bariloche", "MDZ": "Mendoza", "USH": "Ushuaia", "PUJ": "Punta Cana", "SDQ": "Santo Domingo",
+        "CUN": "Cancun", "MEX": "Cidade do Mexico", "CUR": "Curacao", "MIA": "Miami", "MCO": "Orlando",
+        "JFK": "Nova York (JFK)", "EWR": "Nova York (Newark)", "LAX": "Los Angeles", "LAS": "Las Vegas",
+    }
+
+    def _airport_label(self, code: str, city: str = "") -> str:
+        code = (code or "").upper()
+        city = (city or "").strip()
+        if not city:
+            city = self._IATA_CITY.get(code, "")
+        return f"{city} ({code})" if city and code else (city or code)
+
+    @staticmethod
+    def _stops_label(stops: str) -> str:
+        s = (stops or "").strip().lower()
+        if not s:
+            return ""
+        if s.startswith("direto"):
+            return "voo direto"
+        return s
+
+    def _flight_lines(self, leg: dict[str, Any], label: str) -> list[str]:
+        """Linhas de um trecho (ida/volta) com cidade + codigo, horarios, cia e bagagem."""
+        if not leg:
+            return []
+        out = [f"*{label}:* {self._airport_label(leg.get('from_code'), leg.get('from_city'))} "
+               f"{leg.get('dep', '')} -> {self._airport_label(leg.get('to_code'), leg.get('to_city'))} {leg.get('arr', '')}"]
+        extra = []
+        if leg.get("airline"):
+            extra.append(leg["airline"])
+        st = self._stops_label(leg.get("stops", ""))
+        if st:
+            extra.append(st)
+        if leg.get("duration"):
+            extra.append(leg["duration"].replace(" h ", "h").replace(" m", "min"))
+        if extra:
+            out.append("   " + " | ".join(extra))
+        return out
+
+    @staticmethod
+    def _baggage_line(flights: list[dict[str, Any]]) -> str:
+        """Resumo de bagagem (pior caso entre os trechos: se um nao inclui, avisa)."""
+        bags = [f.get("baggage") for f in flights if f.get("baggage")]
+        if not bags:
+            return ""
+        backpack = all(b.get("backpack") for b in bags)
+        hand = all(b.get("hand") for b in bags)
+        checked = all(b.get("checked") for b in bags)
+        if checked:
+            return "🧳 Bagagem: mochila + mala de mao + mala despachada inclusas"
+        if hand:
+            return "🧳 Bagagem: mochila + mala de mao inclusas (mala despachada NAO inclusa, da pra adicionar)"
+        if backpack:
+            return "🧳 Bagagem: so mochila/bolsa de mao inclusa (mala de mao e despachada NAO inclusas, da pra adicionar)"
+        return "🧳 Bagagem: conferir no link (tarifa basica)"
+
+    @staticmethod
+    def _board_line(hotel: dict[str, Any]) -> str:
+        board = (hotel.get("board") or "").lower()
+        if "cafe" in board:
+            return "☕ Cafe da manha incluso"
+        if "all" in board:
+            return "🍽️ All inclusive"
+        if "pensao" in board or "meia" in board:
+            return f"🍽️ {hotel.get('board')}"
+        if board:
+            return "☕ Cafe da manha NAO incluso"
+        return ""
+
     def _format_flight_message(
         self, request: MariaQuoteRequest, dest_name: str, origin: str, result: dict[str, Any]
     ) -> str:
         ida = self._format_date_br(request.checkin)
         volta = self._format_date_br(request.checkout)
+        pax = request.adults + (request.children or 0)
+        details = result.get("details") or {}
+        flights = details.get("flights") or []
+        f_out = next((f for f in flights if f.get("leg") == "out"), None)
+        f_back = next((f for f in flights if f.get("leg") == "back"), None)
         lines = [
-            f"Montei sua passagem pra *{dest_name}*!",
-            f"Saindo de {origin}, ida {ida} e volta {volta}",
-            f"Para {request.adults} adulto(s)",
+            f"Montei sua passagem pra *{dest_name}*! ✈️",
+            "",
+            f"📅 *Datas:* ida {ida} e volta {volta}",
+            f"👥 *Viajantes:* {pax} pessoa(s)",
             "",
         ]
-        flights = result.get("flights") or []
-        if flights and flights[0].get("total"):
-            f0 = flights[0]
-            sym = "R$" if (f0.get("currency") or "BRL") == "BRL" else f0.get("currency")
+        if f_out or f_back:
+            lines.append("✈️ *VOO*")
+            lines += self._flight_lines(f_out, "Ida")
+            lines += self._flight_lines(f_back, "Volta")
+            bl = self._baggage_line(flights)
+            if bl:
+                lines.append(bl)
+            lines.append("")
+        parsed = result.get("flights") or []
+        total_txt = details.get("total_text")
+        if total_txt:
+            lines.append(f"💰 *Total:* R$ {total_txt} para {pax} pessoa(s)")
+            lines.append("Taxas e impostos inclusos")
+            lines.append("")
+        elif parsed and parsed[0].get("total"):
+            f0 = parsed[0]
             total = f"{float(f0['total']):,.0f}".replace(",", ".")
-            air = ", ".join(f0.get("airlines") or []) or "cia aerea"
-            lines.append(f"Melhor opcao: {air}, {sym} {total} total")
-            for leg, label in zip(f0.get("legs") or [], ("Ida", "Volta")):
-                stops = leg.get("stops") or 0
-                stops_txt = "direto" if not stops else (f"{stops} parada" if stops == 1 else f"{stops} paradas")
-                dur = (leg.get("duration") or "").replace(":", "h")
-                dep = (leg.get("departure") or "")[11:16]
-                lines.append(f"   {label}: {leg.get('from')} {dep} -> {leg.get('to')}, {stops_txt}" + (f", {dur}" if dur else ""))
-            if f0.get("checked_bags"):
-                lines.append(f"   {f0['checked_bags']} bagagem despachada inclusa")
+            lines.append(f"💰 *Total:* R$ {total}")
             lines.append("")
         lines += [
-            "Veja a cotacao completa da passagem aqui:",
+            "🔗 *Veja a passagem completa e todos os detalhes aqui:*",
             result.get("quote_url") or "",
             "",
-            "Gostou? Posso te conectar com nosso setor de fechamentos pra garantir essa tarifa!",
+            "Gostou? Posso te conectar com nosso setor de fechamentos pra finalizar! 😊",
         ]
         return "\n".join(lines)
 
@@ -538,37 +627,68 @@ class MariaBridge:
         ida = self._format_date_br(request.checkin)
         volta = self._format_date_br(request.checkout)
         nights = self._calc_nights(request.checkin, request.checkout)
+        pax = request.adults + (request.children or 0)
+        h = result.get("selected_hotel") or ((result.get("hotels") or [None])[0]) or {}
+        summary = result.get("summary") or {}
+        details = result.get("details") or {}
+        flights = details.get("flights") or []
+        f_out = next((f for f in flights if f.get("leg") == "out"), None)
+        f_back = next((f for f in flights if f.get("leg") == "back"), None)
+        if not f_out and summary.get("flight_out"):
+            fo = summary["flight_out"]
+            f_out = {"from_code": fo["from"], "dep": fo["dep"], "to_code": fo["to"], "arr": fo["arr"], "stops": fo["stops"]}
+        if not f_back and summary.get("flight_back"):
+            fb = summary["flight_back"]
+            f_back = {"from_code": fb["from"], "dep": fb["dep"], "to_code": fb["to"], "arr": fb["arr"], "stops": fb["stops"]}
+
         lines = [
-            f"Montei um pacote completo pra *{dest_name}* com voo + hotel!",
-            f"Ida {ida} e volta {volta} ({nights} noites)",
-            f"Para {request.adults} adulto(s)",
+            f"Montei um pacote completo pra *{dest_name}* com voo + hotel! ✈️🏨",
+            "",
+            f"📅 *Datas:* {ida} a {volta} ({nights} noites)",
+            f"👥 *Viajantes:* {pax} pessoa(s)",
             "",
         ]
-        h = result.get("selected_hotel") or ((result.get("hotels") or [None])[0])
-        summary = result.get("summary") or {}
+        if f_out or f_back:
+            lines.append("✈️ *VOO*")
+            lines += self._flight_lines(f_out, "Ida")
+            lines += self._flight_lines(f_back, "Volta")
+            bl = self._baggage_line(flights)
+            if bl:
+                lines.append(bl)
+            lines.append("")
         if h:
-            lines.append(f"Hotel: *{h.get('name')}* {self._star_emoji(h.get('stars', 0) or 0)}".rstrip())
-            if h.get("board"):
-                lines.append(f"   {h['board']}")
+            stars = self._star_emoji(h.get("stars", 0) or 0)
+            lines.append("🏨 *HOTEL*")
+            lines.append(f"*{h.get('name')}*" + (f" {stars}" if stars else ""))
+            loc = h.get("zone") or h.get("region") or ""
+            addr = h.get("address") or details.get("hotel_address") or ""
+            if loc and loc.lower() not in addr.lower():
+                lines.append(f"📍 {loc}" + (f" - {addr}" if addr else ""))
+            elif addr:
+                lines.append(f"📍 {addr}")
+            bl = self._board_line(h)
+            if bl:
+                lines.append(bl)
+            if h.get("review_score"):
+                lines.append(f"⭐ Nota {h['review_score']} dos hospedes")
+            if h.get("cancellation_policy") == "fully_refundable" or h.get("free_cancellation_available"):
+                lines.append("✅ Cancelamento gratis")
+            lines.append("")
         if summary.get("price_total"):
             total = f"{summary['price_total']:,.0f}".replace(",", ".")
-            pax = summary.get("pax") or request.adults
-            line = f"Voo + hotel: R$ {total} total para {pax} pessoas"
+            spax = summary.get("pax") or pax
+            line = f"💰 *Total voo + hotel:* R$ {total} para {spax} pessoas"
             if summary.get("price_per_person"):
                 pp = f"{summary['price_per_person']:,.0f}".replace(",", ".")
                 line += f" (R$ {pp} por pessoa)"
             lines.append(line)
-        fo, fb = summary.get("flight_out"), summary.get("flight_back")
-        if fo and fb:
-            lines.append(f"Voo: ida {fo['from']} {fo['dep']} -> {fo['to']} {fo['arr']} ({str(fo['stops']).lower()})")
-            lines.append(f"     volta {fb['from']} {fb['dep']} -> {fb['to']} {fb['arr']} ({str(fb['stops']).lower()})")
-        if h or summary.get("price_total"):
+            lines.append("Taxas e impostos inclusos")
             lines.append("")
         lines += [
-            "Veja o pacote completo (voo + hotel) num link so:",
+            "🔗 *Veja o pacote completo e todos os detalhes aqui:*",
             result.get("quote_url") or "",
             "",
-            "Gostou? Posso te conectar com nosso setor de fechamentos pra finalizar tudo!",
+            "Gostou? Posso te conectar com nosso setor de fechamentos pra finalizar tudo! 😊",
         ]
         return "\n".join(lines)
 
