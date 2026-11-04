@@ -449,7 +449,8 @@ class QuoteMixin:
                 except Exception:
                     pass
 
-        self._page.on("response", _on_resp)
+        _page0 = self._page
+        _page0.on("response", _on_resp)
         summary: dict[str, Any] = {}
         hotels: list[dict[str, Any]] = []
         region_pick: Optional[dict[str, Any]] = None
@@ -489,7 +490,11 @@ class QuoteMixin:
 
             trip_id = await self._click_comprar_and_reach_checkout()
         finally:
-            self._page.remove_listener("response", _on_resp)
+            # a pagina pode ter sido trocada (popup do card): remove do page original
+            try:
+                _page0.remove_listener("response", _on_resp)
+            except Exception:
+                pass
 
         q = await self._generate_quotation(
             trip_id,
