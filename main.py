@@ -271,6 +271,133 @@ async def list_destinations():
 
 
 # ---------------------------------------------------------------------------
+# Admin Endpoints — Cookie Injection
+# ---------------------------------------------------------------------------
+
+ADMIN_COOKIE_EXTRACT_SCRIPT = """
+// Rode este script no Console do Chrome enquanto logado no HotelDo
+// (em qualquer pagina de pt-hoteldo.e-agencias.com ou ag00124871-hoteldo.e-agencias.com)
+//
+// Ele copia os cookies pro clipboard. Depois cole no endpoint:
+// POST https://hoteldo-quoter-production.up.railway.app/admin/inject-cookies
+
+(async () => {
+    const cookies = document.cookie.split('; ').map(c => {
+        const [name, ...rest] = c.split('=');
+        return {
+            name: name,
+            value: rest.join('='),
+            domain: '.' + location.hostname.split('.').slice(-3).join('.'),
+            path: '/',
+            secure: location.protocol === 'https:',
+            sameSite: 'Lax'
+        };
+    });
+    const json = JSON.stringify(cookies, null, 2);
+    try {
+        await navigator.clipboard.writeText(json);
+        console.log('Cookies copiados! (' + cookies.length + ' cookies)');
+        console.log('Cole no POST /admin/inject-cookies');
+    } catch {
+        console.log(json);
+        console.log('Copie o JSON acima manualmente.');
+    }
+})();
+""".strip()
+
+
+class InjectCookiesRequest(BaseModel):
+    """Request para injetar cookies."""
+    cookies: list[dict[str, Any]]
+    password: str = Field(..., description="Senha admin (lcviagens2024)")
+
+
+@app.get("/admin/extract-script")
+async def get_extract_script():
+    """
+    Retorna o script JavaScript que Lucas deve rodar no Console do Chrome
+    enquanto logado no HotelDo para extrair os cookies de sessao.
+    """
+    return {
+        "instructions": (
+            "1. Abra o HotelDo no Chrome (ja logado)\n"
+            "2. Abra o Console (F12 → Console)\n"
+            "3. Cole e execute o script abaixo\n"
+            "4. Os cookies serao copiados pro clipboard\n"
+            "5. Faca POST /admin/inject-cookies com {cookies: <COLAR>, password: 'lcviagens2024'}"
+        ),
+        "script": ADMIN_COOKIE_EXTRACT_SCRIPT,
+    }
+
+
+@app.post("/admin/inject-cookies")
+async def inject_cookies(request: InjectCookiesRequest):
+    """
+    Injeta cookies de sessao do Chrome no Playwright.
+    Isso bypassa o reCAPTCHA — o servico usa a sessao do Lucas.
+    """
+    import os
+
+    expected_pw = os.environ.get("ADMIN_PASSWORD", "lcviagens2024")
+    if request.password != expected_pw:
+        raise HTTPException(status_code=401, detail="Senha incorreta")
+
+    if not request.cookies:
+        raise HTTPException(status_code=400, detail="Lista de cookies vazia")
+
+    logger.info("Recebido POST /admin/inject-cookies com %d cookies", len(request.cookies))
+
+    # Salvar cookies em disco para reutilizacao em restarts
+    from pathlib import Path
+    cookies_path = str(Path(settings.browser_state_path) / "cookies.json")
+    hoteldo_client.save_cookies_to_file(request.cookies, cookies_path)
+
+    # Injetar no contexto Playwright ativo
+    try:
+        success = await hoteldo_client.inject_cookies(request.cookies)
+    except Exception as exc:
+        logger.error("Erro ao injetar cookies: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Erro: {exc}")
+
+    if success:
+        return {
+            "status": "ok",
+            "message": "Cookies injetados — sessao autenticada!",
+            "authenticated": True,
+        }
+    else:
+        return {
+            "status": "partial",
+            "message": (
+                "Cookies salvos mas sessao nao autenticou. "
+                "Possivel que os cookies ja expiraram. "
+                "Relogue no Chrome e extraia novamente."
+            ),
+            "authenticated": False,
+        }
+
+
+@app.get("/admin/session-status")
+async def session_status():
+    """Verifica status da sessao atual."""
+    health = await hoteldo_client.check_health()
+    from pathlib import Path
+    cookies_file = Path(settings.browser_state_path) / "cookies.json"
+    state_file = Path(settings.browser_state_path) / "state.json"
+
+    return {
+        "authenticated": health.get("session_authenticated", False),
+        "browser_running": health.get("browser_running", False),
+        "cookies_file_exists": cookies_file.exists(),
+        "state_file_exists": state_file.exists(),
+        "suggestion": (
+            "Sessao OK" if health.get("session_authenticated")
+            else "Use GET /admin/extract-script para obter o script de extracao de cookies"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Error handler global
 # ---------------------------------------------------------------------------
 

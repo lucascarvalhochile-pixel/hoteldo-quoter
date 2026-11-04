@@ -1,4 +1,4 @@
-""" 
+"""
 Cliente de automacao HotelDo via Playwright.
 
 O HotelDo (ag00124871-hoteldo.e-agencias.com) eh construido sobre a infraestrutura
@@ -161,6 +161,93 @@ class HotelDoClient:
             return False
 
     # -------------------------------------------------------------------------
+    # Cookie Injection (bypass reCAPTCHA)
+    # -------------------------------------------------------------------------
+
+    async def inject_cookies(self, cookies: list[dict]) -> bool:
+        """
+        Injeta cookies de sessao no contexto Playwright.
+
+        Args:
+            cookies: Lista de dicts no formato Playwright/Chrome:
+                     [{name, value, domain, path, ...}, ...]
+
+        Returns:
+            True se a sessao ficou autenticada apos injecao.
+        """
+        if not self._context:
+            raise HotelDoAuthError("Browser nao iniciado — chame start() primeiro")
+
+        logger.info("Injetando %d cookies no contexto Playwright...", len(cookies))
+
+        # Normalizar cookies pro formato Playwright
+        pw_cookies = []
+        for c in cookies:
+            cookie = {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c.get("domain", ".e-agencias.com"),
+                "path": c.get("path", "/"),
+            }
+            # Playwright exige sameSite valido
+            ss = c.get("sameSite", "Lax")
+            if ss in ("Strict", "Lax", "None"):
+                cookie["sameSite"] = ss
+            else:
+                cookie["sameSite"] = "Lax"
+            # secure e httpOnly
+            if c.get("secure"):
+                cookie["secure"] = True
+            if c.get("httpOnly"):
+                cookie["httpOnly"] = True
+            pw_cookies.append(cookie)
+
+        await self._context.add_cookies(pw_cookies)
+        logger.info("Cookies injetados. Verificando sessao...")
+
+        # Navegar para o portal e verificar se a sessao esta ativa
+        await self._page.goto(
+            settings.hoteldo_base_url,
+            wait_until="domcontentloaded",
+            timeout=settings.navigation_timeout_ms,
+        )
+        await self._page.wait_for_timeout(3000)
+
+        current_url = self._page.url
+        if "/login" not in current_url and "/auth" not in current_url:
+            if await self._check_session_valid():
+                self._authenticated = True
+                await self._save_state()
+                logger.info("Cookie injection OK — sessao autenticada (URL: %s)", current_url)
+                return True
+
+        logger.warning(
+            "Cookie injection falhou — sessao nao autenticada (URL: %s)", current_url
+        )
+        return False
+
+    async def inject_cookies_from_file(self, path: str) -> bool:
+        """Carrega cookies de um JSON file e injeta."""
+        try:
+            with open(path, "r") as f:
+                cookies = json.load(f)
+            return await self.inject_cookies(cookies)
+        except FileNotFoundError:
+            logger.debug("Arquivo de cookies nao encontrado: %s", path)
+            return False
+        except Exception as exc:
+            logger.warning("Erro ao carregar cookies de %s: %s", path, exc)
+            return False
+
+    def save_cookies_to_file(self, cookies: list[dict], path: str) -> None:
+        """Salva cookies brutos em um JSON file para reutilizacao."""
+        state_path = Path(path).parent
+        state_path.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(cookies, f, indent=2)
+        logger.info("Cookies salvos em %s", path)
+
+    # -------------------------------------------------------------------------
     # Login
     # -------------------------------------------------------------------------
 
@@ -168,31 +255,26 @@ class HotelDoClient:
         """
         Autentica no portal HotelDo.
 
-        Fluxo real (descoberto em nov/2026):
-        1. Navegar para https://pt-hoteldo.e-agencias.com/login/signin
-           (o dominio da agencia redireciona para pt-hoteldo.e-agencias.com)
-        2. A pagina /login/signin tem:
-           - input type="text" placeholder="meunome@exemplo.com" (email)
-           - reCAPTCHA v2 checkbox
-           - link "Seguinte" (nao botao)
-        3. Preencher email, resolver reCAPTCHA (ou esperar auto-pass), clicar Seguinte
-        4. Pagina de senha aparece — preencher e submeter
-        5. Aguardar redirecionamento para dashboard
-        6. Salvar estado (cookies de sessao)
+        Estrategia em camadas:
+        1. Tentar restaurar sessao salva em disco (state.json)
+        2. Tentar cookies injetados via /admin/inject-cookies (cookies.json)
+        3. Fallback: login via browser (vai falhar se reCAPTCHA bloquear)
+
+        O reCAPTCHA v2 na pagina de login bloqueia automacao headless.
+        A forma confiavel de autenticar eh via cookie injection:
+        - Lucas loga manualmente no Chrome
+        - Roda script no console que extrai cookies
+        - POST /admin/inject-cookies com o JSON
+        - Servico usa esses cookies ate expirarem
         """
         async with self._login_lock:
             if self._authenticated:
                 return
 
-            if not settings.hoteldo_email or not settings.hoteldo_password:
-                raise HotelDoAuthError(
-                    "HOTELDO_EMAIL e HOTELDO_PASSWORD devem estar configurados"
-                )
-
             logger.info("Iniciando login no HotelDo para %s", settings.hoteldo_email)
 
+            # --- Camada 1: estado salvo (cookies de sessao anterior) ---
             try:
-                # 1. Tentar restaurar sessao existente primeiro
                 await self._page.goto(
                     settings.hoteldo_base_url,
                     wait_until="domcontentloaded",
@@ -206,148 +288,147 @@ class HotelDoClient:
                         logger.info("Sessao restaurada de estado salvo")
                         self._authenticated = True
                         return
-
-                # 2. Navegar direto para o formulario de signin
-                logger.info("Navegando para pagina de login...")
-                await self._page.goto(
-                    settings.hoteldo_login_url,
-                    wait_until="domcontentloaded",
-                    timeout=settings.navigation_timeout_ms,
-                )
-                await self._page.wait_for_timeout(3000)
-
-                # Remover flag de automacao do navigator.webdriver
-                await self._page.evaluate("""
-                    () => {
-                        Object.defineProperty(navigator, 'webdriver', {
-                            get: () => undefined
-                        });
-                    }
-                """)
-
-                # 3. Preencher email
-                logger.info("Preenchendo email...")
-                email_sel = (
-                    'input[placeholder*="exemplo"], '
-                    'input[placeholder*="mail"], '
-                    'input[type="text"][placeholder]'
-                )
-                await self._page.wait_for_selector(
-                    email_sel, state="visible", timeout=15000
-                )
-                email_input = self._page.locator(email_sel).first
-                # Simular digitacao humana
-                await email_input.click()
-                await self._page.wait_for_timeout(500)
-                await email_input.fill(settings.hoteldo_email)
-                await self._page.wait_for_timeout(1000)
-
-                # 4. Tentar lidar com reCAPTCHA
-                logger.info("Verificando reCAPTCHA...")
-                try:
-                    recaptcha_frame = self._page.frame_locator(
-                        'iframe[src*="recaptcha"]'
-                    )
-                    checkbox = recaptcha_frame.locator(
-                        '#recaptcha-anchor, .recaptcha-checkbox-border'
-                    )
-                    if await checkbox.count() > 0:
-                        logger.info("reCAPTCHA encontrado, tentando clicar...")
-                        await checkbox.first.click()
-                        # Esperar resposta do reCAPTCHA (pode auto-resolver)
-                        await self._page.wait_for_timeout(5000)
-                    else:
-                        logger.info("reCAPTCHA checkbox nao encontrado, continuando...")
-                except Exception as e:
-                    logger.warning("reCAPTCHA handling falhou: %s — continuando", e)
-
-                # 5. Clicar "Seguinte" (eh um link <a>, nao um button)
-                logger.info("Clicando Seguinte...")
-                next_sel = (
-                    'a:has-text("Seguinte"), '
-                    'a:has-text("Siguiente"), '
-                    'a:has-text("Next"), '
-                    'button:has-text("Seguinte"), '
-                    '[class*="next"], [class*="submit"]'
-                )
-                await self._page.locator(next_sel).first.click()
-                await self._page.wait_for_timeout(3000)
-
-                # 6. Verificar se chegou na pagina de senha
-                logger.info("Aguardando pagina de senha...")
-                current_url = self._page.url
-                logger.info("URL apos Seguinte: %s", current_url)
-
-                # Tentar encontrar campo de senha (pode ser na mesma pagina ou nova)
-                password_sel = 'input[type="password"]'
-                try:
-                    await self._page.wait_for_selector(
-                        password_sel, state="visible", timeout=15000
-                    )
-                    logger.info("Campo de senha encontrado, preenchendo...")
-                    await self._page.locator(password_sel).first.click()
-                    await self._page.wait_for_timeout(300)
-                    await self._page.locator(password_sel).first.fill(
-                        settings.hoteldo_password
-                    )
-                    await self._page.wait_for_timeout(500)
-
-                    # Submeter formulario de senha
-                    submit_sel = (
-                        'button[type="submit"], '
-                        'input[type="submit"], '
-                        'a:has-text("Entrar"), '
-                        'a:has-text("Ingresar"), '
-                        'button:has-text("Entrar"), '
-                        'button:has-text("Ingresar"), '
-                        'button:has-text("Login"), '
-                        'button:has-text("Iniciar"), '
-                        'a:has-text("Iniciar")'
-                    )
-                    await self._page.locator(submit_sel).first.click()
-                except Exception:
-                    # Pode ser que reCAPTCHA bloqueou e nao avancou
-                    page_text = await self._page.evaluate(
-                        "() => document.body?.innerText?.substring(0, 500) || ''"
-                    )
-                    logger.error(
-                        "Nao encontrou campo de senha. URL: %s, Texto: %s",
-                        self._page.url, page_text[:200]
-                    )
-                    raise HotelDoAuthError(
-                        f"Login travou na etapa de senha — provavelmente reCAPTCHA bloqueou. "
-                        f"URL: {self._page.url}"
-                    )
-
-                # 7. Aguardar navegacao pos-login
-                await self._page.wait_for_timeout(5000)
-
-                # 8. Verificar se login foi bem-sucedido
-                post_url = self._page.url
-                if "/login" in post_url or "/auth" in post_url:
-                    error_text = await self._page.evaluate("""
-                        () => {
-                            const el = document.querySelector(
-                                '.error, .alert-danger, .login-error, [class*="error"]'
-                            );
-                            return el ? el.textContent.trim() : null;
-                        }
-                    """)
-                    raise HotelDoAuthError(
-                        f"Login falhou — ainda na pagina de login. "
-                        f"URL: {post_url}. Erro: {error_text or 'nenhum detectado'}"
-                    )
-
-                # 9. Salvar estado
-                await self._save_state()
-                self._authenticated = True
-                logger.info("Login realizado com sucesso (URL: %s)", post_url)
-
-            except HotelDoAuthError:
-                raise
             except Exception as exc:
-                logger.error("Falha no login: %s", exc)
-                raise HotelDoAuthError(f"Login falhou: {exc}") from exc
+                logger.warning("Falha ao restaurar estado salvo: %s", exc)
+
+            # --- Camada 2: cookies injetados ---
+            cookies_file = str(
+                Path(settings.browser_state_path) / "cookies.json"
+            )
+            if await self.inject_cookies_from_file(cookies_file):
+                return
+
+            # --- Camada 3: login via browser (fallback) ---
+            if not settings.hoteldo_email or not settings.hoteldo_password:
+                raise HotelDoAuthError(
+                    "Sessao expirada e credenciais nao configuradas. "
+                    "Use POST /admin/inject-cookies para injetar cookies do Chrome."
+                )
+
+            logger.warning(
+                "Tentando login via browser (reCAPTCHA pode bloquear)..."
+            )
+            await self._try_browser_login()
+
+    async def _try_browser_login(self) -> None:
+        """
+        Tenta login via automacao do browser.
+        AVISO: reCAPTCHA v2 bloqueia em headless. Este eh um fallback.
+        """
+        try:
+            await self._page.goto(
+                settings.hoteldo_login_url,
+                wait_until="domcontentloaded",
+                timeout=settings.navigation_timeout_ms,
+            )
+            await self._page.wait_for_timeout(3000)
+
+            # Remover flag de automacao
+            await self._page.evaluate("""
+                () => {
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                }
+            """)
+
+            # Preencher email
+            logger.info("Preenchendo email...")
+            email_sel = (
+                'input[placeholder*="exemplo"], '
+                'input[placeholder*="mail"], '
+                'input[type="text"][placeholder]'
+            )
+            await self._page.wait_for_selector(
+                email_sel, state="visible", timeout=15000
+            )
+            email_input = self._page.locator(email_sel).first
+            await email_input.click()
+            await self._page.wait_for_timeout(500)
+            await email_input.fill(settings.hoteldo_email)
+            await self._page.wait_for_timeout(1000)
+
+            # Tentar reCAPTCHA (usar iframe anchor especificamente)
+            logger.info("Verificando reCAPTCHA...")
+            try:
+                recaptcha_frame = self._page.frame_locator(
+                    'iframe[src*="recaptcha/api2/anchor"]'
+                )
+                checkbox = recaptcha_frame.locator(
+                    '#recaptcha-anchor, .recaptcha-checkbox-border'
+                ).first
+                if await checkbox.count() > 0:
+                    logger.info("reCAPTCHA encontrado, tentando clicar...")
+                    await checkbox.click()
+                    await self._page.wait_for_timeout(5000)
+            except Exception as e:
+                logger.warning("reCAPTCHA handling falhou: %s — continuando", e)
+
+            # Clicar "Seguinte"
+            logger.info("Clicando Seguinte...")
+            next_sel = (
+                'a:has-text("Seguinte"), '
+                'a:has-text("Siguiente"), '
+                'a:has-text("Next"), '
+                'button:has-text("Seguinte")'
+            )
+            await self._page.locator(next_sel).first.click()
+            await self._page.wait_for_timeout(3000)
+
+            logger.info("URL apos Seguinte: %s", self._page.url)
+
+            # Preencher senha
+            password_sel = 'input[type="password"]'
+            try:
+                await self._page.wait_for_selector(
+                    password_sel, state="visible", timeout=15000
+                )
+                logger.info("Campo de senha encontrado, preenchendo...")
+                await self._page.locator(password_sel).first.fill(
+                    settings.hoteldo_password
+                )
+                await self._page.wait_for_timeout(500)
+
+                submit_sel = (
+                    'button[type="submit"], '
+                    'a:has-text("Entrar"), '
+                    'button:has-text("Entrar")'
+                )
+                await self._page.locator(submit_sel).first.click()
+            except Exception:
+                page_text = await self._page.evaluate(
+                    "() => document.body?.innerText?.substring(0, 500) || ''"
+                )
+                logger.error(
+                    "Nao encontrou campo de senha. URL: %s, Texto: %s",
+                    self._page.url, page_text[:200]
+                )
+                raise HotelDoAuthError(
+                    "Login travou na etapa de senha — reCAPTCHA bloqueou. "
+                    "Use POST /admin/inject-cookies para injetar cookies do Chrome."
+                )
+
+            # Verificar sucesso
+            await self._page.wait_for_timeout(5000)
+            post_url = self._page.url
+            if "/login" in post_url or "/auth" in post_url:
+                raise HotelDoAuthError(
+                    "Login falhou — reCAPTCHA bloqueou. "
+                    "Use POST /admin/inject-cookies para injetar cookies do Chrome."
+                )
+
+            await self._save_state()
+            self._authenticated = True
+            logger.info("Login via browser OK (URL: %s)", post_url)
+
+        except HotelDoAuthError:
+            raise
+        except Exception as exc:
+            logger.error("Falha no login via browser: %s", exc)
+            raise HotelDoAuthError(
+                f"Login via browser falhou: {exc}. "
+                "Use POST /admin/inject-cookies para injetar cookies do Chrome."
+            ) from exc
 
     # -------------------------------------------------------------------------
     # Suggestions API (HTTP direto, sem browser, sem autenticacao)
