@@ -652,7 +652,7 @@ class HotelDoClient(TokenAuthMixin):
                 availability_data.append(body)
                 logger.info(
                     "Availability response capturada: %d items",
-                    len(body.get("items", body.get("results", []))),
+                    len(body.get("availability", body.get("items", body.get("results", [])))),
                 )
                 capture_done.set()
             except Exception as exc:
@@ -715,135 +715,154 @@ class HotelDoClient(TokenAuthMixin):
         """
         Parseia as responses da API de disponibilidade em lista de hoteis.
 
-        A API retorna estrutura Despegar com items/results contendo clusters de hoteis.
-        Cada item pode ter: id, name, stars, main_price, packages, etc.
+        Estrutura real (s-accommodations/api/accommodations/availability):
+        {
+          "availability": [
+            {
+              "accommodation": {id, name, stars, location{address, city{name}}, reviews{rating, total}, pictures[]},
+              "room_pack_id": "...",
+              "prices": {currency, price_for_delta (total), unit_price_for_delta (noite), main, ...},
+              "agency": {commission, net_price, commission_percentage},
+              "tracking_info": {"item": {meal_plan, cancellation_policy, supplier}},
+              "detail_url": "..."
+            }, ...
+          ],
+          "paging": {page, limit, total}
+        }
+        Tambem aceita o formato legado items/results (fallback do DOM).
         """
         hotels: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
 
         for response_data in responses:
-            # A API Despegar pode retornar "items" ou "results"
             items = (
-                response_data.get("items")
+                response_data.get("availability")
+                or response_data.get("items")
                 or response_data.get("results")
                 or response_data.get("hotels")
                 or []
             )
 
             for item in items:
-                hotel_id = str(
-                    item.get("id")
-                    or item.get("hotel_id")
-                    or item.get("accommodation_id")
-                    or ""
-                )
-                if not hotel_id or hotel_id in seen_ids:
-                    continue
-                seen_ids.add(hotel_id)
-
                 hotel = self._normalize_hotel(item)
-                if hotel:
-                    hotels.append(hotel)
-
+                if not hotel:
+                    continue
+                if not hotel["id"] or hotel["id"] in seen_ids:
+                    continue
+                seen_ids.add(hotel["id"])
+                hotels.append(hotel)
                 if len(hotels) >= MAX_HOTELS_TO_EXTRACT:
                     break
 
-        # Ordenar por preco (menor primeiro)
-        hotels.sort(key=lambda h: h.get("total_price", float("inf")))
+        # Ordenar por preco (menor primeiro); sem preco vai pro fim
+        hotels.sort(key=lambda h: h.get("total_price") or float("inf"))
         return hotels
 
     @staticmethod
+    def _to_float(v: Any) -> float:
+        """Converte '2.900' / '4.988,50' / 2900 em float."""
+        if v is None:
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        s = s.replace("R$", "").replace(" ", "")
+        if "," in s:
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            # "2.900" eh milhar em pt-BR
+            parts = s.split(".")
+            if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]):
+                s = "".join(parts)
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    @staticmethod
     def _normalize_hotel(raw: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """Normaliza um item de hotel da API Despegar para formato padrao."""
-        # Extrair nome
-        name = (
-            raw.get("name")
-            or raw.get("hotel_name")
-            or raw.get("accommodation_name")
-            or ""
-        )
+        """Normaliza um item de availability (ou item legado) para formato padrao."""
+        acc = raw.get("accommodation") or raw
+        name = acc.get("name") or raw.get("hotel_name") or ""
         if not name:
             return None
 
-        # Extrair estrelas
-        stars = raw.get("stars") or raw.get("star_rating") or raw.get("category") or 0
-        if isinstance(stars, str):
-            try:
-                stars = int(float(stars))
-            except (ValueError, TypeError):
-                stars = 0
+        hotel_id = str(acc.get("id") or raw.get("id") or raw.get("hotel_id") or "")
 
-        # Extrair preco — estrutura Despegar tem varias formas
-        price_data = raw.get("main_price") or raw.get("price") or {}
-        if isinstance(price_data, dict):
-            total_price = (
-                price_data.get("total")
-                or price_data.get("amount")
-                or price_data.get("final_price")
-                or 0
-            )
-            nightly_price = price_data.get("nightly") or price_data.get("per_night") or 0
-            currency = price_data.get("currency") or "BRL"
-        elif isinstance(price_data, (int, float)):
-            total_price = price_data
-            nightly_price = 0
-            currency = "BRL"
-        else:
-            total_price = 0
-            nightly_price = 0
-            currency = "BRL"
+        stars = acc.get("stars") or raw.get("stars") or 0
+        try:
+            stars = int(float(stars))
+        except (ValueError, TypeError):
+            stars = 0
 
-        # Extrair regime de alimentacao
-        board = ""
-        packages = raw.get("packages") or raw.get("rooms") or []
-        if packages and isinstance(packages, list):
-            first_pkg = packages[0] if packages else {}
-            board = (
-                first_pkg.get("meal_plan")
-                or first_pkg.get("board")
-                or first_pkg.get("board_type")
-                or ""
-            )
-            # Se o preco veio vazio, tentar do primeiro pacote
-            if not total_price:
-                pkg_price = first_pkg.get("price") or first_pkg.get("total") or {}
-                if isinstance(pkg_price, dict):
-                    total_price = pkg_price.get("total") or pkg_price.get("amount") or 0
-                elif isinstance(pkg_price, (int, float)):
-                    total_price = pkg_price
+        prices = raw.get("prices") or {}
+        total_price = HotelDoClient._to_float(
+            prices.get("price_for_delta") or prices.get("main") or raw.get("total_price")
+        )
+        nightly_price = HotelDoClient._to_float(
+            prices.get("unit_price_for_delta")
+            or (prices.get("unit") or {}).get("value")
+            or raw.get("nightly_price")
+        )
+        currency = prices.get("currency") or raw.get("currency") or "BRL"
+        price_text = prices.get("main_text") or ""
+        discount = ""
+        promo = prices.get("promotion") or {}
+        if promo.get("items"):
+            discount = str(promo["items"][0].get("value") or "").strip()
 
-        # Extrair imagem
-        image = ""
-        images = raw.get("images") or raw.get("pictures") or []
-        if images:
-            first_img = images[0] if isinstance(images, list) else images
-            if isinstance(first_img, dict):
-                image = first_img.get("url") or first_img.get("src") or ""
-            elif isinstance(first_img, str):
-                image = first_img
+        loc = acc.get("location") or {}
+        address = loc.get("address") or raw.get("address") or ""
+        zone = (loc.get("zone") or {}).get("name") or ""
+        city = (loc.get("city") or {}).get("name") or ""
 
-        # Extrair room_pack_id (necessario para detalhe/carrinho)
-        room_pack_id = ""
-        if packages and isinstance(packages, list) and packages:
-            room_pack_id = str(
-                packages[0].get("room_pack_id")
-                or packages[0].get("id")
-                or packages[0].get("pack_id")
-                or ""
-            )
+        reviews = acc.get("reviews") or {}
+        review_score = reviews.get("rating") or raw.get("review_score") or 0
+
+        tinfo = (raw.get("tracking_info") or {}).get("item") or {}
+        meal_plan = tinfo.get("meal_plan") or ""
+        meal_plan = {
+            "H": "Somente hospedagem",
+            "B": "Cafe da manha incluso",
+            "F": "Pensao completa",
+            "A": "All inclusive",
+            "M": "Meia pensao",
+        }.get(meal_plan, meal_plan)
+        cancellation = tinfo.get("cancellation_policy") or ""
+        free_cancel = any(
+            (li.get("id") == "options_with_free_cancellation")
+            for li in (raw.get("list_items") or [])
+            if isinstance(li, dict)
+        )
+
+        agency = raw.get("agency") or {}
+
+        pics = acc.get("pictures") or []
+        image = pics[0] if pics and isinstance(pics[0], str) else ""
 
         return {
-            "id": str(raw.get("id") or raw.get("hotel_id") or ""),
+            "id": hotel_id,
             "name": name,
-            "stars": int(stars),
-            "total_price": float(total_price),
-            "nightly_price": float(nightly_price),
+            "stars": stars,
+            "total_price": total_price,
+            "nightly_price": nightly_price,
             "currency": currency,
-            "board": str(board),
+            "price_text": price_text,
+            "discount": discount,
+            "board": meal_plan,
+            "cancellation_policy": cancellation,
+            "free_cancellation_available": free_cancel,
             "image": image,
-            "room_pack_id": room_pack_id,
-            "address": raw.get("address") or raw.get("location") or "",
-            "review_score": raw.get("review_score") or raw.get("rating") or 0,
+            "room_pack_id": str(raw.get("room_pack_id") or ""),
+            "address": address,
+            "zone": zone,
+            "city": city,
+            "review_score": review_score,
+            "review_count": reviews.get("total") or 0,
+            "detail_url": raw.get("detail_url") or "",
+            "agency_commission": HotelDoClient._to_float(agency.get("commission")),
+            "agency_net_price": HotelDoClient._to_float(agency.get("net_price")),
+            "commission_percentage": agency.get("commission_percentage"),
         }
 
     async def _extract_hotels_from_dom(self) -> dict[str, Any]:
