@@ -462,6 +462,13 @@ async def debug_session():
     return await hoteldo_client.debug_session()
 
 
+@app.get("/admin/debug-search")
+async def debug_search(destination_id: str = "CIT_6624", checkin: str = "2027-01-15",
+                       checkout: str = "2027-01-20", max_chars: int = 6000):
+    """Devolve a resposta bruta da API de availability (pra ajustar o parser)."""
+    return await hoteldo_client.debug_search_raw(destination_id, checkin, checkout, max_chars)
+
+
 @app.get("/admin/session-status")
 async def session_status():
     """Verifica status da sessao atual."""

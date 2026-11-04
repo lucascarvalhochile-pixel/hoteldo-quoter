@@ -174,6 +174,50 @@ class TokenAuthMixin:
         result["authenticated"] = ok
         return result
 
+    async def debug_search_raw(
+        self, destination_id: str, checkin: str, checkout: str, max_chars: int = 6000
+    ) -> dict[str, Any]:
+        """Navega pra URL de busca e devolve a(s) resposta(s) brutas da API de availability."""
+        import asyncio
+        from datetime import date as _date
+
+        await self.ensure_authenticated()
+        url = self._build_search_url(
+            destination_id, _date.fromisoformat(checkin), _date.fromisoformat(checkout)
+        )
+        captured: list[dict[str, Any]] = []
+        done = asyncio.Event()
+
+        async def _on_resp(resp):
+            if "availability" not in resp.url:
+                return
+            try:
+                txt = await resp.text()
+            except Exception as exc:
+                txt = f"<err {exc}>"
+            captured.append({
+                "url": resp.url[:300],
+                "method": resp.request.method,
+                "status": resp.status,
+                "post_data": (resp.request.post_data or "")[:1500],
+                "len": len(txt),
+                "body_head": txt[:max_chars],
+            })
+            if resp.status == 200 and len(txt) > 200:
+                done.set()
+
+        self._page.on("response", _on_resp)
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded")
+            try:
+                await asyncio.wait_for(done.wait(), timeout=45)
+            except asyncio.TimeoutError:
+                pass
+            await self._page.wait_for_timeout(2000)
+        finally:
+            self._page.remove_listener("response", _on_resp)
+        return {"search_url": url, "page_url": self._page.url, "captured": captured}
+
     async def debug_session(self) -> dict[str, Any]:
         """Diagnostico: cookies no contexto, URL atual e status da API de sessao."""
         info: dict[str, Any] = {}
