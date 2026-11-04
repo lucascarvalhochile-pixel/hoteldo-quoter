@@ -1,4 +1,4 @@
-""" 
+"""
 Configuracao centralizada do hoteldo-quoter.
 Todas as variaveis vem de environment variables para deploy seguro no Railway.
 """
@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     hoteldo_email: str = ""
     hoteldo_password: str = ""
     hoteldo_agency_id: str = "AG00124871"
+    # E-mail usado no "Gerar cotacao" quando o cliente nao tem e-mail
+    # (a cotacao fica em Minhas Cotacoes do Socrates de qualquer forma)
+    quote_default_email: str = "camilagusmao@lucascarvalhoturismo.com.br"
+    quote_default_phone: str = "11999999999"
 
     # --- API Endpoints (Despegar/fenix backend) ---
     hoteldo_suggestions_url: str = (
