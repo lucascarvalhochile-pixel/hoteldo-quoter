@@ -377,6 +377,85 @@ async def inject_cookies(request: InjectCookiesRequest):
         }
 
 
+class TokenLoginRequest(BaseModel):
+    password: str
+    status_token: str
+    login_token: str
+
+
+@app.post("/admin/token-login")
+async def token_login(request: TokenLoginRequest):
+    """
+    Login via HTTP direto usando tokens reCAPTCHA gerados num Chrome real.
+    Os cookies httpOnly retornados pelo HotelDo sao injetados no Playwright.
+
+    Para gerar os tokens: GET /admin/token-script e rodar no console de
+    qualquer pagina *.e-agencias.com. O script gera os dois tokens e ja
+    faz o POST aqui.
+    """
+    import os
+
+    expected_pw = os.environ.get("ADMIN_PASSWORD", "lcviagens2024")
+    if request.password != expected_pw:
+        raise HTTPException(status_code=401, detail="Senha incorreta")
+
+    logger.info("Recebido POST /admin/token-login")
+    try:
+        result = await hoteldo_client.login_with_tokens(
+            status_token=request.status_token,
+            login_token=request.login_token,
+        )
+    except Exception as exc:
+        logger.exception("Erro no token-login")
+        raise HTTPException(status_code=500, detail=f"Erro: {exc}")
+
+    return {
+        "status": "ok" if result.get("authenticated") else "fail",
+        **result,
+    }
+
+
+TOKEN_LOGIN_SCRIPT = r"""
+// Rodar no console de qualquer pagina *.e-agencias.com (ex: ag00124871-hoteldo).
+// Gera os dois tokens reCAPTCHA e envia pro hoteldo-quoter fazer o login.
+(async () => {
+  const SERVICE = 'https://hoteldo-quoter-production.up.railway.app';
+  const PW = prompt('Senha admin do hoteldo-quoter:');
+  const KEY_CB  = '6Lf8DV4UAAAAAASCK2DF67REViA95WPoXf-1vZsH';   // checkbox (user/status)
+  const KEY_INV = '6Lf-DV4UAAAAAAYyG-Mh_BArXmHQUiutk7kN1FRg';   // invisivel (login)
+  await new Promise((res, rej) => {
+    if (window.grecaptcha && grecaptcha.render) return res();
+    const s = document.createElement('script');
+    s.src = 'https://www.google.com/recaptcha/api.js?render=explicit';
+    s.onload = () => setTimeout(res, 1500); s.onerror = rej;
+    document.head.appendChild(s);
+  });
+  const mk = (id, css) => { const d = document.createElement('div'); d.id = id; if (css) d.style.cssText = css; document.body.appendChild(d); return d; };
+  mk('lc-inv');
+  mk('lc-cb', 'position:fixed;top:80px;left:20px;z-index:99999;background:#fff;padding:8px;border:2px solid #0100FE');
+  const tok = {};
+  const wInv = grecaptcha.render('lc-inv', { sitekey: KEY_INV, size: 'invisible', callback: t => tok.inv = t });
+  grecaptcha.render('lc-cb', { sitekey: KEY_CB, callback: t => tok.cb = t });
+  grecaptcha.execute(wInv);
+  console.log('Clique no checkbox "Nao sou um robo" que apareceu no canto superior esquerdo...');
+  while (!tok.cb || !tok.inv) await new Promise(r => setTimeout(r, 500));
+  console.log('Tokens prontos, enviando...');
+  const r = await fetch(SERVICE + '/admin/token-login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: PW, status_token: tok.cb, login_token: tok.inv })
+  });
+  const j = await r.json(); console.log(j); alert('hoteldo-quoter: ' + j.status);
+  document.getElementById('lc-cb').remove();
+})();
+"""
+
+
+@app.get("/admin/token-script")
+async def token_script():
+    """Retorna o script JS que gera tokens reCAPTCHA e dispara o token-login."""
+    return {"script": TOKEN_LOGIN_SCRIPT}
+
+
 @app.get("/admin/session-status")
 async def session_status():
     """Verifica status da sessao atual."""
