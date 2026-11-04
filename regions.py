@@ -8,6 +8,7 @@ tem que cair dentro de um desses poligonos. Coordenadas (lat, lon).
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 # destino (chave normalizada do DESTINATION_MAP / CIT) -> lista de poligonos
@@ -65,6 +66,35 @@ PREFERRED_REGIONS: dict[str, dict[str, list[tuple[float, float]]]] = {
 }
 
 
+# Nunca oferecer (regra do Lucas, 04/11): hotel com esses termos no nome/zona/endereco
+# sai da lista mesmo que caia dentro de um poligono (o poligono "Centro" desenhado
+# no mapa estica pela Alameda ate a Estacion Central).
+EXCLUDED_TERMS: dict[str, list[str]] = {
+    "CIT_6624": [
+        "estación central", "estacion central", "estación", "pudahuel", "aeropuerto", "aeroporto",
+        "maipú", "maipu", "quinta normal", "san bernardo", "la florida", "puente alto",
+        "recoleta", "independencia", "franklin", "san miguel", "cerrillos", "lo prado",
+        "barrio república", "barrio republica", "república", "republica",
+    ],
+}
+
+# Limite oeste do "Centro" de Santiago: a oeste disso e Estacion Central / Republica,
+# que o Lucas nao quer (clip do poligono desenhado).
+MIN_LON: dict[str, float] = {"CIT_6624": -70.662}
+
+
+def is_excluded(dest_cit: str, hotel: dict) -> bool:
+    blob = " ".join(
+        str(hotel.get(k) or "") for k in ("name", "zone", "address", "distance")
+    ).lower()
+    if any(t in blob for t in EXCLUDED_TERMS.get(dest_cit, [])):
+        return True
+    lon = hotel.get("longitude")
+    if lon is not None and dest_cit in MIN_LON and lon < MIN_LON[dest_cit]:
+        return True
+    return False
+
+
 def point_in_polygon(lat: float, lon: float, poly: list[tuple[float, float]]) -> bool:
     """Ray casting. poly = [(lat, lon), ...]."""
     inside = False
@@ -100,13 +130,16 @@ def pick_preferred_hotel(dest_cit: str, hotels: list[dict[str, Any]]) -> Optiona
     Escolhe o hotel do pacote dentro das regioes preferidas:
       1. so hoteis com coordenadas dentro de algum poligono
       2. nota >= 8.0 quando houver (senao qualquer um da regiao)
-      3. mais barato primeiro; empate -> cafe da manha incluso primeiro
+      3. REGION_PICK_STRATEGY=relevance (padrao): 1o da ordem do HotelDo;
+         =cheapest: mais barato, cafe da manha desempata
     Retorna None se nenhum hotel da lista cai na regiao.
     """
     if not has_preferred_regions(dest_cit):
         return None
     in_region = []
     for h in hotels:
+        if is_excluded(dest_cit, h):
+            continue
         reg = region_of(dest_cit, h.get("latitude"), h.get("longitude"))
         if reg:
             h["region"] = reg
@@ -115,9 +148,11 @@ def pick_preferred_hotel(dest_cit: str, hotels: list[dict[str, Any]]) -> Optiona
         return None
     good = [h for h in in_region if (h.get("review_score") or 0) >= 8.0] or in_region
     priced = [h for h in good if (h.get("total_price") or 0) > 0] or good
-
-    def _key(h):
-        board = (h.get("board") or "").lower()
-        return (h.get("total_price") or 9e12, 0 if "cafe" in board else 1)
-
-    return sorted(priced, key=_key)[0]
+    strategy = os.getenv("REGION_PICK_STRATEGY", "relevance").strip().lower()
+    if strategy == "cheapest":
+        def _key(h):
+            board = (h.get("board") or "").lower()
+            return (h.get("total_price") or 9e12, 0 if "cafe" in board else 1)
+        return sorted(priced, key=_key)[0]
+    # "relevance" (padrao): mantem a ordem de relevancia do proprio HotelDo
+    return priced[0]

@@ -465,11 +465,12 @@ class QuoteMixin:
             # dentro do poligono. Se o recomendado pelo planner ja esta na regiao,
             # mantem; senao troca pelo melhor da regiao (clicando "Ver detalhe"
             # no card, o que muda a hospedagem do pacote).
-            from regions import has_preferred_regions, pick_preferred_hotel, region_of
+            from regions import has_preferred_regions, is_excluded, pick_preferred_hotel, region_of
             if has_preferred_regions(dest_cit) and hotels:
                 current_name = (summary.get("hotel_name") or "").strip().lower()
                 current = next((h for h in hotels if h.get("name", "").strip().lower() == current_name), None)
-                if current and region_of(dest_cit, current.get("latitude"), current.get("longitude")):
+                if (current and not is_excluded(dest_cit, current)
+                        and region_of(dest_cit, current.get("latitude"), current.get("longitude"))):
                     current["region"] = region_of(dest_cit, current.get("latitude"), current.get("longitude"))
                     logger.info("Regiao: hotel recomendado '%s' ja esta em %s", current.get("name"), current["region"])
                     region_applied = True
@@ -550,21 +551,61 @@ class QuoteMixin:
             if not found:
                 logger.info("Regiao: card de '%s' nao encontrado na lista", hotel_name)
                 return False
-            await self._page.evaluate(
-                """(name) => {
-                    const btns = [...document.querySelectorAll('button')].filter(b => /Ver detalhe/i.test(b.innerText));
-                    for (const b of btns) {
-                        let c = b;
-                        for (let k = 0; k < 8 && c; k++) { c = c.parentElement; if (c && c.innerText.length > 150) break; }
-                        if (c && c.innerText.toLowerCase().includes(name)) { b.click(); return; }
-                    }
-                }""",
-                target,
+            # O card pode abrir o detalhe em NOVA ABA (window.open). Captura popup;
+            # se nao vier, assume navegacao na mesma pagina.
+            click_js = """(name) => {
+                const btns = [...document.querySelectorAll('button')].filter(b => /Ver detalhe/i.test(b.innerText));
+                for (const b of btns) {
+                    let c = b;
+                    for (let k = 0; k < 8 && c; k++) { c = c.parentElement; if (c && c.innerText.length > 150) break; }
+                    if (c && c.innerText.toLowerCase().includes(name)) { b.click(); return true; }
+                }
+                return false;
+            }"""
+            # Clique REAL (mouse) no botao do card: acha o elemento com o nome do hotel e
+            # sobe ate o ancestral mais proximo que tem um "Ver detalhe".
+            safe_name = hotel_name.strip().replace('"', "")
+            xpath = (
+                f'xpath=(//*[contains(normalize-space(.), "{safe_name}") and not(self::body) and not(self::html)]'
+                f'/ancestor-or-self::*[.//button[contains(., "Ver detalhe")]][1]//button[contains(., "Ver detalhe")])[1]'
             )
+            new_page = None
+            clicked = False
+            try:
+                loc = self._page.locator(xpath)
+                if await loc.count():
+                    await loc.first.scroll_into_view_if_needed(timeout=5000)
+                    try:
+                        async with self._page.expect_popup(timeout=8000) as pop:
+                            await loc.first.click(timeout=5000)
+                        new_page = await pop.value
+                    except Exception:
+                        new_page = None
+                    clicked = True
+            except Exception as exc:
+                logger.info("Regiao: clique real falhou (%s), tentando via JS", exc)
+            if not clicked:
+                try:
+                    async with self._page.expect_popup(timeout=8000) as pop:
+                        await self._page.evaluate(click_js, target)
+                    new_page = await pop.value
+                except Exception:
+                    new_page = None
+            if new_page is not None:
+                old_page = self._page
+                self._page = new_page
+                try:
+                    await old_page.close()
+                except Exception:
+                    pass
+                logger.info("Regiao: detalhe abriu em nova aba")
             for _ in range(40):
                 await self._page.wait_for_timeout(1000)
                 if "/trip/accommodations/detail/" in self._page.url:
                     break
+            if "/trip/accommodations/detail/" not in self._page.url:
+                logger.info("Regiao: nao chegou na pagina de detalhe (url=%s)", self._page.url[:120])
+                return False
             await self._page.wait_for_selector('a:has-text("Comprar"), button:has-text("Comprar")', timeout=60000)
             await self._page.wait_for_timeout(1500)
             ok = await self._page.evaluate(
