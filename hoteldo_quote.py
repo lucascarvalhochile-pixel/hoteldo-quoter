@@ -322,38 +322,84 @@ class QuoteMixin:
             "quote_id": trip_id,
             "quote_url": q["quote_url"],
             "search_url": url,
-            "flights": self._parse_flight_search(search_data),
+            "flights": self._safe_parse_flights(search_data),
             "status": "created",
         }
 
+    @classmethod
+    def _safe_parse_flights(cls, search_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        try:
+            return cls._parse_flight_search(search_data)
+        except Exception as exc:
+            logger.warning("Resumo de voos falhou (link segue valido): %s", exc)
+            return []
+
     @staticmethod
     def _parse_flight_search(responses: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Resumo dos itinerarios (melhor esforco; estrutura Despegar 'clusters')."""
+        """
+        Resumo dos itinerarios. Estrutura real (flights-busquets/api/v1/web/search):
+        {
+          "items": [{"item": {
+              "priceDetail": {"totalFare": {"amount": 4826}, "mainFare": {"amount": 1868}, "adultTotal": 2414},
+              "airlines": ["L0"], "validatingCarrier": "JJ",
+              "agencyDetail": {"commission": {"amount": 254}},
+              "routeChoices": [{"routes": [{"stopsCount", "totalDuration", "departure", "arrival",
+                                            "segments": [{"departure":{"airportCode","date"}, "arrival":{...},
+                                                          "airlineCode", "flightId", "duration"}]}]}],
+              "baggageV2": {"backpack", "carryOn", "checkedBagQuantity"}
+          }}],
+          "referenceData": {"airlines": {"L0": "LATAM", "G3": "Gol"}},
+          "highlights": {"cheapestItinerary": {"priceTotal": {"amount"}}}
+        }
+        """
         out: list[dict[str, Any]] = []
         for data in responses:
-            clusters = (
-                data.get("clusters")
-                or (data.get("items") or {}).get("clusters")
-                or (data.get("data") or {}).get("clusters")
-                or []
-            )
-            for c in clusters[:5]:
-                price = c.get("price") or {}
-                segs = c.get("segments") or []
-                airlines = set()
-                for s in segs:
-                    for ch in (s.get("choices") or [])[:1]:
-                        for leg in ch.get("legs") or ch.get("segments") or []:
-                            a = (leg.get("airline") or {}).get("name") if isinstance(leg.get("airline"), dict) else leg.get("airline")
-                            if a:
-                                airlines.add(str(a))
-                out.append({
-                    "total": price.get("total") or price.get("amount") or price.get("final_price"),
-                    "per_adult": price.get("adult") or price.get("per_adult"),
-                    "currency": price.get("currency") or "BRL",
-                    "airlines": sorted(airlines),
-                    "raw_keys": list(c.keys())[:15],
-                })
+            if not isinstance(data, dict):
+                continue
+            names = ((data.get("referenceData") or {}).get("airlines") or {})
+            items = data.get("items") or []
+            for wrap in items[:5]:
+                try:
+                    it = wrap.get("item") if isinstance(wrap, dict) else None
+                    if not it:
+                        continue
+                    pd = it.get("priceDetail") or {}
+                    total = (pd.get("totalFare") or {}).get("amount")
+                    per_adult = pd.get("adultTotal") or (pd.get("mainFare") or {}).get("amount")
+                    codes = it.get("airlines") or ([it.get("validatingCarrier")] if it.get("validatingCarrier") else [])
+                    airlines = [str(names.get(c, c)) for c in codes if c]
+                    legs = []
+                    for rc in it.get("routeChoices") or []:
+                        routes = rc.get("routes") or []
+                        r = routes[rc.get("selectedRouteIndex") or 0] if routes else None
+                        if not r:
+                            continue
+                        segs = r.get("segments") or []
+                        legs.append({
+                            "from": (segs[0].get("departure") or {}).get("airportCode") if segs else None,
+                            "to": (segs[-1].get("arrival") or {}).get("airportCode") if segs else None,
+                            "departure": (segs[0].get("departure") or {}).get("date") if segs else None,
+                            "arrival": (segs[-1].get("arrival") or {}).get("date") if segs else None,
+                            "stops": r.get("stopsCount"),
+                            "duration": r.get("totalDuration"),
+                            "flights": [sg.get("flightId") for sg in segs],
+                        })
+                    bag = it.get("baggageV2") or {}
+                    out.append({
+                        "total": total,
+                        "per_adult": per_adult,
+                        "currency": pd.get("currencyCode") or "BRL",
+                        "airlines": airlines,
+                        "legs": legs,
+                        "checked_bags": bag.get("checkedBagQuantity"),
+                        "carry_on": bag.get("carryOn"),
+                        "agency_commission": ((it.get("agencyDetail") or {}).get("commission") or {}).get("amount"),
+                    })
+                except Exception as exc:  # resumo eh best-effort, nunca derruba a cotacao
+                    logger.debug("parse flight item falhou: %s", exc)
+            hl = (data.get("highlights") or {}).get("cheapestItinerary") or {}
+            if hl:
+                out.sort(key=lambda f: f.get("total") or float("inf"))
         return out
 
     # -------------------------------------------------------------------------

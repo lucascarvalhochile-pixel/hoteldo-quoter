@@ -515,6 +515,14 @@ class MariaBridge:
             total = f"{float(f0['total']):,.0f}".replace(",", ".")
             air = ", ".join(f0.get("airlines") or []) or "cia aerea"
             lines.append(f"Melhor opcao: {air}, {sym} {total} total")
+            for leg, label in zip(f0.get("legs") or [], ("Ida", "Volta")):
+                stops = leg.get("stops") or 0
+                stops_txt = "direto" if not stops else (f"{stops} parada" if stops == 1 else f"{stops} paradas")
+                dur = (leg.get("duration") or "").replace(":", "h")
+                dep = (leg.get("departure") or "")[11:16]
+                lines.append(f"   {label}: {leg.get('from')} {dep} -> {leg.get('to')}, {stops_txt}" + (f", {dur}" if dur else ""))
+            if f0.get("checked_bags"):
+                lines.append(f"   {f0['checked_bags']} bagagem despachada inclusa")
             lines.append("")
         lines += [
             "Veja a cotacao completa da passagem aqui:",
