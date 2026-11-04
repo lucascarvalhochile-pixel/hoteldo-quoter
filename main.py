@@ -456,6 +456,12 @@ async def token_script():
     return {"script": TOKEN_LOGIN_SCRIPT}
 
 
+@app.get("/admin/debug-session")
+async def debug_session():
+    """Diagnostico da sessao Playwright (cookies, URL, status API)."""
+    return await hoteldo_client.debug_session()
+
+
 @app.get("/admin/session-status")
 async def session_status():
     """Verifica status da sessao atual."""
