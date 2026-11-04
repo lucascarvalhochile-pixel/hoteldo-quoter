@@ -63,18 +63,24 @@ DESTINATION_MAP: dict[str, str] = {
 
     # --- Colombia ---
     "bogota": "CIT_854",
+    "bogota": "CIT_854",
     "cartagena": "CIT_1535",
     "cartagena de indias": "CIT_1535",
     "san andres": "CIT_6350",
+    "san andres": "CIT_6350",
+    "colombia": "CIT_854",
     "colombia": "CIT_854",
 
     # --- Mexico ---
     "cancun": "CIT_1569",
+    "cancun": "CIT_1569",
     "cidade do mexico": "CIT_4475",
+    "mexico": "CIT_1569",
     "mexico": "CIT_1569",
 
     # --- Caribe ---
     "punta cana": "CIT_5963",
+    "republica dominicana": "CIT_5963",
     "republica dominicana": "CIT_5963",
 
     # --- EUA ---
@@ -83,6 +89,7 @@ DESTINATION_MAP: dict[str, str] = {
 
     # --- Uruguai ---
     "montevideo": "CIT_4685",
+    "montevideu": "CIT_4685",
     "montevideu": "CIT_4685",
 }
 
@@ -374,9 +381,17 @@ class MariaBridge:
             star_str = self._star_emoji(stars) if stars else ""
             lines.append(f"{i}. *{name}* {star_str}")
             if price:
-                lines.append(f"   {currency} {price:,.2f} total")
+                sym = "R$" if currency == "BRL" else currency
+                total_fmt = f"{price:,.0f}".replace(",", ".")
+                nightly = hotel.get("nightly_price") or 0
+                per_night = (
+                    f" ({sym} {nightly:,.0f}/noite)".replace(",", ".") if nightly else ""
+                )
+                lines.append(f"   {sym} {total_fmt} total{per_night}")
             if board:
                 lines.append(f"   {board}")
+            if hotel.get("cancellation_policy") == "fully_refundable":
+                lines.append("   Cancelamento gratis")
             lines.append("")
 
         if len(hotels) > 3:
