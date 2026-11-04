@@ -617,7 +617,7 @@ class MariaBridge:
             "🔗 *Veja a passagem completa e todos os detalhes aqui:*",
             result.get("quote_url") or "",
             "",
-            "Gostou? Posso te conectar com nosso setor de fechamentos pra finalizar! 😊",
+            "Gostou? Se quiser ajustar algo (datas, hotel, cidade de saída) ou ver outro destino, me diz que eu monto outra opção. E quando quiser garantir a reserva, é só me avisar! 😊",
         ]
         return "\n".join(lines)
 
@@ -688,7 +688,7 @@ class MariaBridge:
             "🔗 *Veja o pacote completo e todos os detalhes aqui:*",
             result.get("quote_url") or "",
             "",
-            "Gostou? Posso te conectar com nosso setor de fechamentos pra finalizar tudo! 😊",
+            "Gostou? Se quiser ajustar algo (datas, hotel, cidade de saída) ou ver outro destino, me diz que eu monto outra opção. E quando quiser garantir a reserva, é só me avisar! 😊",
         ]
         return "\n".join(lines)
 
@@ -764,17 +764,16 @@ class MariaBridge:
 
         # Link de cotacao (se criado com sucesso)
         if quote_url:
-            lines.append("Veja seu orcamento completo aqui:")
+            lines.append("🔗 *Veja seu orçamento completo aqui:*")
             lines.append(quote_url)
             lines.append("")
             lines.append(
-                "Gostou de alguma opcao? Posso te conectar com nosso "
-                "setor de fechamentos de viagens pra finalizar tudo!"
+                "Gostou de alguma opção? Se quiser ajustar datas ou ver outros hotéis, "
+                "me diz que eu monto outra opção. E quando quiser garantir a reserva, é só me avisar! 😊"
             )
         else:
             lines.append(
-                "Quer que eu prepare o orcamento completo pra voce? "
-                "Nosso setor de fechamentos finaliza tudo rapidinho!"
+                "Quer que eu prepare o orçamento completo pra você? É só me dizer!"
             )
 
         return "\n".join(lines)
