@@ -144,8 +144,7 @@ class HotelDoClient(TokenAuthMixin):
             self._authenticated = False
         await self.login()
 
-    async def _check_session_valid(self) -> bool:
-        """Verifica se a sessao autenticada ainda eh valida."""
+    async def _socrates_status_ok(self) -> bool:
         try:
             response = await self._page.evaluate("""
                 async () => {
@@ -159,6 +158,31 @@ class HotelDoClient(TokenAuthMixin):
             """)
             return bool(response)
         except Exception:
+            return False
+
+    async def _check_session_valid(self) -> bool:
+        """
+        Verifica se a sessao autenticada ainda eh valida.
+
+        O Socrates (CRM de cotacoes) tem sessao propria, criada pelo handshake
+        GET /socrates/auth/social a partir da sessao social (cookie dss).
+        Se o status retornar 401, faz o handshake uma vez e tenta de novo.
+        """
+        if await self._socrates_status_ok():
+            return True
+        try:
+            logger.info("Socrates 401 — fazendo handshake /socrates/auth/social")
+            await self._page.goto(
+                f"{settings.hoteldo_base_url}/socrates/auth/social",
+                wait_until="domcontentloaded",
+                timeout=settings.navigation_timeout_ms,
+            )
+            await self._page.wait_for_timeout(3000)
+            if "/login" in self._page.url:
+                return False
+            return await self._socrates_status_ok()
+        except Exception as exc:
+            logger.warning("Handshake Socrates falhou: %s", exc)
             return False
 
     # -------------------------------------------------------------------------
