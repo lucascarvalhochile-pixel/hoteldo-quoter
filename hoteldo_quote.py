@@ -448,9 +448,11 @@ class QuoteMixin:
                     pass
 
         self._page.on("response", _on_resp)
+        summary: dict[str, Any] = {}
         try:
             await self._page.goto(url, wait_until="domcontentloaded")
             await self._wait_trip_id_in_url(90)
+            summary = await self._scrape_package_summary()
             trip_id = await self._click_comprar_and_reach_checkout()
         finally:
             self._page.remove_listener("response", _on_resp)
@@ -462,11 +464,58 @@ class QuoteMixin:
             client_email=client_data.get("email", ""),
         )
         hotels = self._parse_availability_results(avail) if avail else []
+        # O hotel que esta NO pacote eh o "Hospedagem selecionada" do planner,
+        # nao o mais barato da lista
+        selected = None
+        if summary.get("hotel_name"):
+            for h in hotels:
+                if h.get("name", "").strip().lower() == summary["hotel_name"].strip().lower():
+                    selected = h
+                    break
+            if not selected:
+                selected = {"name": summary["hotel_name"], "stars": summary.get("stars") or 0}
         return {
             "product": "package",
             "quote_id": trip_id,
             "quote_url": q["quote_url"],
             "search_url": url,
             "hotels": hotels,
+            "selected_hotel": selected,
+            "summary": summary,
             "status": "created",
         }
+
+    async def _scrape_package_summary(self) -> dict[str, Any]:
+        """Le do planner o hotel selecionado e o preco final do pacote (best-effort)."""
+        try:
+            await self._page.wait_for_selector('text=/Comprar/', timeout=60000)
+            await self._page.wait_for_timeout(1500)
+            data = await self._page.evaluate(r"""
+                () => {
+                    const txt = document.body.innerText || '';
+                    const out = {};
+                    let m = txt.match(/Hospedagem selecionada\s*\n\s*([^\n]+)/);
+                    if (m) out.hotel_name = m[1].trim();
+                    m = txt.match(/Pre[cç]o final por pessoa\s*\n?\s*(?:\(i\)\s*)?R\$\s*([\d\.]+)/);
+                    if (m) out.price_per_person = m[1];
+                    m = txt.match(/Final\s+(\d+)\s+pessoas?\s*R\$\s*([\d\.]+)/);
+                    if (m) { out.pax = parseInt(m[1]); out.price_total = m[2]; }
+                    m = txt.match(/Seu ganho\s*R\$\s*([\d\.]+)/);
+                    if (m) out.agency_revenue = m[1];
+                    m = txt.match(/Alterar voo\s*\n([A-Z]{3})\n(\d\d:\d\d)\n([^\n]+)\n([A-Z]{3})\n(\d\d:\d\d)\n([A-Z]{3})\n(\d\d:\d\d)\n([^\n]+)\n([A-Z]{3})\n(\d\d:\d\d)/);
+                    if (m) {
+                        out.flight_out = {from: m[1], dep: m[2], stops: m[3], to: m[4], arr: m[5]};
+                        out.flight_back = {from: m[6], dep: m[7], stops: m[8], to: m[9], arr: m[10]};
+                    }
+                    out.snippet = txt.slice(0, 600);
+                    return out;
+                }
+            """)
+            for k in ("price_per_person", "price_total", "agency_revenue"):
+                if data.get(k):
+                    data[k] = float(str(data[k]).replace(".", ""))
+            logger.info("Resumo do pacote: %s", {k: v for k, v in data.items() if k != "snippet"})
+            return data
+        except Exception as exc:
+            logger.warning("Nao consegui ler resumo do pacote: %s", exc)
+            return {}

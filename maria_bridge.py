@@ -544,12 +544,25 @@ class MariaBridge:
             f"Para {request.adults} adulto(s)",
             "",
         ]
-        hotels = result.get("hotels") or []
-        if hotels:
-            h = hotels[0]
-            lines.append(f"Hotel sugerido: *{h.get('name')}* {self._star_emoji(h.get('stars', 0))}")
+        h = result.get("selected_hotel") or ((result.get("hotels") or [None])[0])
+        summary = result.get("summary") or {}
+        if h:
+            lines.append(f"Hotel: *{h.get('name')}* {self._star_emoji(h.get('stars', 0) or 0)}".rstrip())
             if h.get("board"):
                 lines.append(f"   {h['board']}")
+        if summary.get("price_total"):
+            total = f"{summary['price_total']:,.0f}".replace(",", ".")
+            pax = summary.get("pax") or request.adults
+            line = f"Voo + hotel: R$ {total} total para {pax} pessoas"
+            if summary.get("price_per_person"):
+                pp = f"{summary['price_per_person']:,.0f}".replace(",", ".")
+                line += f" (R$ {pp} por pessoa)"
+            lines.append(line)
+        fo, fb = summary.get("flight_out"), summary.get("flight_back")
+        if fo and fb:
+            lines.append(f"Voo: ida {fo['from']} {fo['dep']} -> {fo['to']} {fo['arr']} ({str(fo['stops']).lower()})")
+            lines.append(f"     volta {fb['from']} {fb['dep']} -> {fb['to']} {fb['arr']} ({str(fb['stops']).lower()})")
+        if h or summary.get("price_total"):
             lines.append("")
         lines += [
             "Veja o pacote completo (voo + hotel) num link so:",
