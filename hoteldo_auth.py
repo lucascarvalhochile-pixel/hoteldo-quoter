@@ -218,6 +218,50 @@ class TokenAuthMixin:
             self._page.remove_listener("response", _on_resp)
         return {"search_url": url, "page_url": self._page.url, "captured": captured}
 
+    async def debug_capture(
+        self, url: str, match: str, max_chars: int = 8000, wait_s: int = 45,
+        click_text: str = "",
+    ) -> dict[str, Any]:
+        """Navega pra `url`, captura responses cujo URL contem `match`, opcionalmente clica num texto."""
+        import asyncio
+
+        await self.ensure_authenticated()
+        captured: list[dict[str, Any]] = []
+        done = asyncio.Event()
+
+        async def _on_resp(resp):
+            if match not in resp.url:
+                return
+            try:
+                txt = await resp.text()
+            except Exception as exc:
+                txt = f"<err {exc}>"
+            captured.append({
+                "url": resp.url[:300], "method": resp.request.method,
+                "status": resp.status, "len": len(txt),
+                "post_data": (resp.request.post_data or "")[:1500],
+                "body_head": txt[:max_chars],
+            })
+            if resp.status == 200 and len(txt) > 500:
+                done.set()
+
+        self._page.on("response", _on_resp)
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded")
+            if click_text:
+                try:
+                    await self._page.locator(f'text="{click_text}"').first.click(timeout=30000)
+                except Exception as exc:
+                    captured.append({"click_error": str(exc)[:300]})
+            try:
+                await asyncio.wait_for(done.wait(), timeout=wait_s)
+            except asyncio.TimeoutError:
+                pass
+            await self._page.wait_for_timeout(2000)
+        finally:
+            self._page.remove_listener("response", _on_resp)
+        return {"page_url": self._page.url, "captured": captured}
+
     async def debug_session(self) -> dict[str, Any]:
         """Diagnostico: cookies no contexto, URL atual e status da API de sessao."""
         info: dict[str, Any] = {}

@@ -105,6 +105,9 @@ class QuoteRequest(BaseModel):
     children: int = Field(default=0, ge=0, le=6, description="Criancas por quarto")
     children_ages: list[int] = Field(default_factory=list, description="Idades das criancas")
     rooms: int = Field(default=1, ge=1, le=5, description="Numero de quartos")
+    product: str = Field(default="hotel", description="hotel | flight | package")
+    origem: Optional[str] = Field(default=None, description="Cidade/aeroporto de saida")
+    infants: int = Field(default=0, ge=0, le=4)
 
     # Dados do cliente (opccionais)
     client_name: Optional[str] = None
@@ -174,8 +177,8 @@ async def create_quote(request: QuoteRequest):
     Este endpoint eh chamado pela MARIA quando um lead pede cotacao de hotel.
     """
     logger.info(
-        "POST /quote: destino=%s, checkin=%s, checkout=%s",
-        request.destino, request.checkin, request.checkout,
+        "POST /quote: product=%s destino=%s origem=%s checkin=%s checkout=%s",
+        request.product, request.destino, request.origem, request.checkin, request.checkout,
     )
 
     maria_request = MariaQuoteRequest(
@@ -186,6 +189,9 @@ async def create_quote(request: QuoteRequest):
         children=request.children,
         children_ages=request.children_ages,
         rooms=request.rooms,
+        product=request.product,
+        origem=request.origem,
+        infants=request.infants,
         client_name=request.client_name,
         client_email=request.client_email,
         client_phone=request.client_phone,
@@ -467,6 +473,13 @@ async def debug_search(destination_id: str = "CIT_6624", checkin: str = "2027-01
                        checkout: str = "2027-01-20", max_chars: int = 6000):
     """Devolve a resposta bruta da API de availability (pra ajustar o parser)."""
     return await hoteldo_client.debug_search_raw(destination_id, checkin, checkout, max_chars)
+
+
+@app.get("/admin/debug-capture")
+async def debug_capture(url: str, match: str, max_chars: int = 8000, wait_s: int = 45,
+                        click_text: str = ""):
+    """Navega pra uma URL do HotelDo e devolve responses cujo URL contem `match`."""
+    return await hoteldo_client.debug_capture(url, match, max_chars, wait_s, click_text)
 
 
 @app.get("/admin/session-status")

@@ -213,3 +213,214 @@ class QuoteMixin:
             "checkout": checkout.isoformat(),
             "status": "created",
         }
+
+    # -------------------------------------------------------------------------
+    # Helpers comuns: esperar PR na URL, clicar Comprar, modal de bagagem
+    # -------------------------------------------------------------------------
+
+    async def _wait_trip_id_in_url(self, timeout_s: int = 60) -> str:
+        for _ in range(timeout_s):
+            m = TRIP_ID_RE.search(self._page.url)
+            if m:
+                return m.group(1)
+            await self._page.wait_for_timeout(1000)
+        raise HotelDoQuoteError(f"Sem trip id na URL apos {timeout_s}s: {self._page.url[:200]}")
+
+    async def _click_comprar_and_reach_checkout(self, sort_cheapest: bool = False) -> str:
+        """Clica no primeiro 'Comprar', trata modal de bagagem, espera /checkout/{PR}/form."""
+        comprar_sel = 'a:has-text("Comprar"), button:has-text("Comprar")'
+        await self._page.wait_for_selector(comprar_sel, state="visible", timeout=90000)
+
+        if sort_cheapest:
+            try:
+                tab = self._page.locator('text=/Mais baratos/i').first
+                if await tab.count():
+                    await tab.click(timeout=5000)
+                    await self._page.wait_for_timeout(3000)
+            except Exception as exc:
+                logger.info("Nao consegui ordenar por mais baratos: %s", exc)
+
+        await self._page.locator(comprar_sel).first.click()
+
+        # Modal de bagagem (voos): "Continuar" mantem a tarifa Basic
+        for _ in range(20):
+            await self._page.wait_for_timeout(1000)
+            if "/checkout/" in self._page.url:
+                break
+            cont = self._page.locator('button:has-text("Continuar")')
+            try:
+                if await cont.count() and await cont.first.is_visible():
+                    await cont.first.click()
+                    logger.info("Modal de bagagem: Continuar")
+            except Exception:
+                pass
+
+        trip_id = await self._wait_trip_id_in_url(90)
+        # Garantir que estamos no /form
+        for _ in range(60):
+            if "/form" in self._page.url:
+                break
+            await self._page.wait_for_timeout(1000)
+        logger.info("Checkout alcancado: %s", self._page.url[:140])
+        return trip_id
+
+    # -------------------------------------------------------------------------
+    # VOO
+    # -------------------------------------------------------------------------
+
+    def _build_flight_url(
+        self, origin: str, destination: str, departure: date, return_date: Optional[date],
+        adults: int = 2, children: int = 0, infants: int = 0,
+    ) -> str:
+        kind = "roundtrip" if return_date else "oneway"
+        path = f"/shop/flights/results/{kind}/{origin.upper()}/{destination.upper()}/{departure.isoformat()}"
+        if return_date:
+            path += f"/{return_date.isoformat()}"
+        path += f"/{adults}/{children}/{infants}"
+        return f"{settings.hoteldo_base_url}{path}"
+
+    async def create_flight_quote(
+        self,
+        origin: str,
+        destination: str,
+        departure: date,
+        return_date: Optional[date],
+        client_data: dict[str, Any],
+        adults: int = 2,
+        children: int = 0,
+        infants: int = 0,
+    ) -> dict[str, Any]:
+        """Busca voos, escolhe o mais barato e gera cotacao compartilhavel."""
+        await self.ensure_authenticated()
+        url = self._build_flight_url(origin, destination, departure, return_date, adults, children, infants)
+        logger.info("Busca de voos: %s", url)
+
+        search_data: list[dict[str, Any]] = []
+
+        async def _on_resp(resp):
+            if "flights-busquets/api/v1/web/search" in resp.url and resp.status == 200:
+                try:
+                    search_data.append(await resp.json())
+                except Exception:
+                    pass
+
+        self._page.on("response", _on_resp)
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded")
+            trip_id = await self._click_comprar_and_reach_checkout(sort_cheapest=True)
+        finally:
+            self._page.remove_listener("response", _on_resp)
+
+        q = await self._generate_quotation(
+            trip_id,
+            client_name=client_data.get("name", ""),
+            client_phone=client_data.get("phone", ""),
+            client_email=client_data.get("email", ""),
+        )
+        return {
+            "product": "flight",
+            "quote_id": trip_id,
+            "quote_url": q["quote_url"],
+            "search_url": url,
+            "flights": self._parse_flight_search(search_data),
+            "status": "created",
+        }
+
+    @staticmethod
+    def _parse_flight_search(responses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Resumo dos itinerarios (melhor esforco; estrutura Despegar 'clusters')."""
+        out: list[dict[str, Any]] = []
+        for data in responses:
+            clusters = (
+                data.get("clusters")
+                or (data.get("items") or {}).get("clusters")
+                or (data.get("data") or {}).get("clusters")
+                or []
+            )
+            for c in clusters[:5]:
+                price = c.get("price") or {}
+                segs = c.get("segments") or []
+                airlines = set()
+                for s in segs:
+                    for ch in (s.get("choices") or [])[:1]:
+                        for leg in ch.get("legs") or ch.get("segments") or []:
+                            a = (leg.get("airline") or {}).get("name") if isinstance(leg.get("airline"), dict) else leg.get("airline")
+                            if a:
+                                airlines.add(str(a))
+                out.append({
+                    "total": price.get("total") or price.get("amount") or price.get("final_price"),
+                    "per_adult": price.get("adult") or price.get("per_adult"),
+                    "currency": price.get("currency") or "BRL",
+                    "airlines": sorted(airlines),
+                    "raw_keys": list(c.keys())[:15],
+                })
+        return out
+
+    # -------------------------------------------------------------------------
+    # PACOTE (voo + hotel) — trip planner FH
+    # -------------------------------------------------------------------------
+
+    def _build_package_url(
+        self, origin_cit: str, dest_cit: str, departure: date, return_date: date,
+        checkin: date, checkout: date, distribution: str,
+    ) -> str:
+        path = (
+            f"/trip/start/FH/{origin_cit}/{dest_cit}/{departure.isoformat()}/{return_date.isoformat()}"
+            f"/{dest_cit}/{checkin.isoformat()}/{checkout.isoformat()}/{distribution}"
+        )
+        return f"{settings.hoteldo_base_url}{path}?from=PSB&nw=true&reSearch=true"
+
+    async def create_package_quote(
+        self,
+        origin_cit: str,
+        dest_cit: str,
+        departure: date,
+        return_date: date,
+        client_data: dict[str, Any],
+        checkin: Optional[date] = None,
+        checkout: Optional[date] = None,
+        adults: int = 2,
+        children: int = 0,
+        children_ages: list[int] | None = None,
+        rooms: int = 1,
+    ) -> dict[str, Any]:
+        """Pacote voo+hotel: trip/start/FH -> resultados (hotel recomendado) -> Comprar -> cotacao."""
+        await self.ensure_authenticated()
+        checkin = checkin or departure
+        checkout = checkout or return_date
+        distribution = self._build_distribution(adults, children, children_ages, rooms)
+        url = self._build_package_url(origin_cit, dest_cit, departure, return_date, checkin, checkout, distribution)
+        logger.info("Busca de pacote: %s", url)
+
+        avail: list[dict[str, Any]] = []
+
+        async def _on_resp(resp):
+            if "/availability" in resp.url and resp.status == 200:
+                try:
+                    avail.append(await resp.json())
+                except Exception:
+                    pass
+
+        self._page.on("response", _on_resp)
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded")
+            await self._wait_trip_id_in_url(90)
+            trip_id = await self._click_comprar_and_reach_checkout()
+        finally:
+            self._page.remove_listener("response", _on_resp)
+
+        q = await self._generate_quotation(
+            trip_id,
+            client_name=client_data.get("name", ""),
+            client_phone=client_data.get("phone", ""),
+            client_email=client_data.get("email", ""),
+        )
+        hotels = self._parse_availability_results(avail) if avail else []
+        return {
+            "product": "package",
+            "quote_id": trip_id,
+            "quote_url": q["quote_url"],
+            "search_url": url,
+            "hotels": hotels,
+            "status": "created",
+        }

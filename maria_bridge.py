@@ -114,6 +114,40 @@ DESTINATION_NAMES: dict[str, str] = {
 }
 
 
+# Aeroporto principal de cada destino (pra busca de voo)
+DESTINATION_IATA: dict[str, str] = {
+    "CIT_6624": "SCL", "CIT_394": "CJC", "CIT_982": "BUE", "CIT_901": "BRC",
+    "CIT_4451": "MDZ", "CIT_4088": "LIM", "CIT_1579": "CUZ", "CIT_854": "BOG",
+    "CIT_1535": "CTG", "CIT_6350": "ADZ", "CIT_1569": "CUN", "CIT_4475": "MEX",
+    "CIT_5963": "PUJ", "CIT_5419": "MCO", "CIT_4625": "MIA", "CIT_4685": "MVD",
+}
+
+# Origem (cidade/aeroporto de saida do cliente) -> IATA
+ORIGIN_IATA: dict[str, str] = {
+    "sao paulo": "GRU", "são paulo": "GRU", "sp": "GRU", "guarulhos": "GRU", "gru": "GRU",
+    "congonhas": "CGH", "campinas": "VCP", "viracopos": "VCP",
+    "rio de janeiro": "GIG", "rio": "GIG", "galeao": "GIG", "galeão": "GIG", "gig": "GIG",
+    "santos dumont": "SDU",
+    "belo horizonte": "CNF", "bh": "CNF", "confins": "CNF", "cnf": "CNF",
+    "brasilia": "BSB", "brasília": "BSB", "bsb": "BSB",
+    "curitiba": "CWB", "porto alegre": "POA", "florianopolis": "FLN", "florianópolis": "FLN",
+    "salvador": "SSA", "recife": "REC", "fortaleza": "FOR", "natal": "NAT", "maceio": "MCZ",
+    "maceió": "MCZ", "belem": "BEL", "belém": "BEL", "manaus": "MAO", "goiania": "GYN",
+    "goiânia": "GYN", "cuiaba": "CGB", "cuiabá": "CGB", "campo grande": "CGR",
+    "vitoria": "VIX", "vitória": "VIX", "joao pessoa": "JPA", "joão pessoa": "JPA",
+    "aracaju": "AJU", "teresina": "THE", "sao luis": "SLZ", "são luís": "SLZ",
+    "londrina": "LDB", "maringa": "MGF", "maringá": "MGF", "ribeirao preto": "RAO",
+    "ribeirão preto": "RAO", "uberlandia": "UDI", "uberlândia": "UDI", "navegantes": "NVT",
+    "foz do iguacu": "IGU", "foz do iguaçu": "IGU", "porto seguro": "BPS", "ilheus": "IOS",
+}
+
+
+def _norm(txt: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFKD", txt or "").encode("ascii", "ignore").decode()
+    return t.strip().lower()
+
+
 # ---------------------------------------------------------------------------
 # Modelos de dados
 # ---------------------------------------------------------------------------
@@ -128,6 +162,12 @@ class MariaQuoteRequest(BaseModel):
     children: int = Field(default=0, ge=0, le=6, description="Numero de criancas")
     children_ages: list[int] = Field(default_factory=list, description="Idades das criancas")
     rooms: int = Field(default=1, ge=1, le=5, description="Numero de quartos")
+
+    # O que o cliente pediu: hotel | flight | package (voo + hotel, link unico)
+    product: str = Field(default="hotel", description="hotel | flight | package")
+    # Cidade/aeroporto de saida (necessario pra flight e package)
+    origem: Optional[str] = Field(default=None, description="Cidade ou IATA de origem")
+    infants: int = Field(default=0, ge=0, le=4)
 
     # Dados do cliente (para cotacao no Socrates)
     client_name: Optional[str] = None
@@ -160,6 +200,7 @@ class MariaQuoteResponse(BaseModel):
 
     success: bool
     message: str  # Mensagem formatada para WhatsApp
+    product: str = "hotel"
     quote_url: Optional[str] = None
     hotels_found: int = 0
     destination_id: Optional[str] = None
@@ -250,6 +291,12 @@ class MariaBridge:
 
         dest_name = DESTINATION_NAMES.get(destination_id, request.destino)
 
+        product = (request.product or "hotel").strip().lower()
+        if product in ("voo", "passagem", "flight", "flights"):
+            return await self._generate_flight_quote(request, destination_id, dest_name)
+        if product in ("pacote", "package", "both", "voo+hotel"):
+            return await self._generate_package_quote(request, destination_id, dest_name)
+
         # 2. Buscar hoteis
         try:
             checkin = date.fromisoformat(request.checkin)
@@ -314,6 +361,7 @@ class MariaBridge:
         # 4. Formatar resposta
         return MariaQuoteResponse(
             success=True,
+            product="hotel",
             message=self._format_results_message(
                 request, hotels, dest_name, quote_url
             ),
@@ -325,8 +373,183 @@ class MariaBridge:
         )
 
     # -------------------------------------------------------------------------
+    # Origem (IATA / CIT) e cotacoes de voo e pacote
+    # -------------------------------------------------------------------------
+
+    def _origin_iata(self, origem: Optional[str]) -> Optional[str]:
+        if not origem:
+            return None
+        o = _norm(origem)
+        if len(o) == 3 and o.isalpha():
+            return o.upper()
+        if o in ORIGIN_IATA:
+            return ORIGIN_IATA[o]
+        for k, v in ORIGIN_IATA.items():
+            if k in o or o in k:
+                return v
+        return None
+
+    async def _origin_cit(self, origem: Optional[str]) -> Optional[str]:
+        """Resolve a cidade de origem pra CIT_ (pacotes usam cidade, nao aeroporto)."""
+        if not origem:
+            return None
+        key = _norm(origem)
+        iata = self._origin_iata(origem)
+        # Nomes amigaveis pros IATA mais comuns (o suggestions entende melhor o nome)
+        iata_to_city = {
+            "SAO": "Sao Paulo", "GRU": "Sao Paulo", "CGH": "Sao Paulo", "VCP": "Campinas",
+            "RIO": "Rio de Janeiro", "GIG": "Rio de Janeiro", "SDU": "Rio de Janeiro",
+            "BHZ": "Belo Horizonte", "CNF": "Belo Horizonte", "BSB": "Brasilia",
+        }
+        query = iata_to_city.get(iata or "", origem)
+        cached = DESTINATION_MAP.get("origem:" + key)
+        if cached:
+            return cached
+        suggestions = await self._client.get_suggestions(query)
+        for sgg in suggestions:
+            if isinstance(sgg, dict) and sgg.get("type") == "CITY" and str(sgg.get("id", "")).startswith("CIT_"):
+                DESTINATION_MAP["origem:" + key] = sgg["id"]
+                return sgg["id"]
+        return None
+
+    def _client_data(self, request: MariaQuoteRequest) -> dict[str, Any]:
+        return {
+            "name": request.client_name or "",
+            "email": request.client_email or "",
+            "phone": request.client_phone or "",
+        }
+
+    async def _generate_flight_quote(
+        self, request: MariaQuoteRequest, destination_id: str, dest_name: str
+    ) -> MariaQuoteResponse:
+        origin = self._origin_iata(request.origem)
+        dest_iata = DESTINATION_IATA.get(destination_id)
+        if not origin or not dest_iata:
+            return MariaQuoteResponse(
+                success=False, product="flight",
+                message=self._format_missing_origin(request.origem, dest_name),
+                error=f"origem/destino sem IATA: origem={request.origem} dest={destination_id}",
+                destination_id=destination_id, destination_name=dest_name,
+            )
+        try:
+            dep = date.fromisoformat(request.checkin)
+            ret = date.fromisoformat(request.checkout)
+            result = await self._client.create_flight_quote(
+                origin=origin, destination=dest_iata, departure=dep, return_date=ret,
+                client_data=self._client_data(request),
+                adults=request.adults, children=request.children, infants=request.infants,
+            )
+        except Exception as exc:
+            logger.error("Erro na cotacao de voo: %s", exc, exc_info=True)
+            return MariaQuoteResponse(
+                success=False, product="flight", message=self._format_search_error(),
+                error=str(exc), destination_id=destination_id, destination_name=dest_name,
+            )
+        return MariaQuoteResponse(
+            success=True, product="flight",
+            message=self._format_flight_message(request, dest_name, origin, result),
+            quote_url=result.get("quote_url"), destination_id=destination_id,
+            destination_name=dest_name, raw_results=result,
+        )
+
+    async def _generate_package_quote(
+        self, request: MariaQuoteRequest, destination_id: str, dest_name: str
+    ) -> MariaQuoteResponse:
+        origin_cit = await self._origin_cit(request.origem)
+        if not origin_cit:
+            return MariaQuoteResponse(
+                success=False, product="package",
+                message=self._format_missing_origin(request.origem, dest_name),
+                error=f"origem sem CIT: {request.origem}",
+                destination_id=destination_id, destination_name=dest_name,
+            )
+        try:
+            dep = date.fromisoformat(request.checkin)
+            ret = date.fromisoformat(request.checkout)
+            result = await self._client.create_package_quote(
+                origin_cit=origin_cit, dest_cit=destination_id, departure=dep, return_date=ret,
+                client_data=self._client_data(request),
+                adults=request.adults, children=request.children,
+                children_ages=request.children_ages, rooms=request.rooms,
+            )
+        except Exception as exc:
+            logger.error("Erro na cotacao de pacote: %s", exc, exc_info=True)
+            return MariaQuoteResponse(
+                success=False, product="package", message=self._format_search_error(),
+                error=str(exc), destination_id=destination_id, destination_name=dest_name,
+            )
+        return MariaQuoteResponse(
+            success=True, product="package",
+            message=self._format_package_message(request, dest_name, result),
+            quote_url=result.get("quote_url"), hotels_found=len(result.get("hotels") or []),
+            destination_id=destination_id, destination_name=dest_name, raw_results=result,
+        )
+
+    # -------------------------------------------------------------------------
     # Formatacao de mensagens para WhatsApp
     # -------------------------------------------------------------------------
+
+    def _format_missing_origin(self, origem: Optional[str], dest_name: str) -> str:
+        if origem:
+            return (
+                f"Nao consegui identificar o aeroporto de saida *{origem}* pra montar "
+                f"a passagem pra *{dest_name}*. Me diz de qual cidade voce sai?"
+            )
+        return f"Pra montar a passagem pra *{dest_name}*, de qual cidade voce sai?"
+
+    def _format_flight_message(
+        self, request: MariaQuoteRequest, dest_name: str, origin: str, result: dict[str, Any]
+    ) -> str:
+        ida = self._format_date_br(request.checkin)
+        volta = self._format_date_br(request.checkout)
+        lines = [
+            f"Montei sua passagem pra *{dest_name}*!",
+            f"Saindo de {origin}, ida {ida} e volta {volta}",
+            f"Para {request.adults} adulto(s)",
+            "",
+        ]
+        flights = result.get("flights") or []
+        if flights and flights[0].get("total"):
+            f0 = flights[0]
+            sym = "R$" if (f0.get("currency") or "BRL") == "BRL" else f0.get("currency")
+            total = f"{float(f0['total']):,.0f}".replace(",", ".")
+            air = ", ".join(f0.get("airlines") or []) or "cia aerea"
+            lines.append(f"Melhor opcao: {air}, {sym} {total} total")
+            lines.append("")
+        lines += [
+            "Veja a cotacao completa da passagem aqui:",
+            result.get("quote_url") or "",
+            "",
+            "Gostou? Posso te conectar com nosso setor de fechamentos pra garantir essa tarifa!",
+        ]
+        return "\n".join(lines)
+
+    def _format_package_message(
+        self, request: MariaQuoteRequest, dest_name: str, result: dict[str, Any]
+    ) -> str:
+        ida = self._format_date_br(request.checkin)
+        volta = self._format_date_br(request.checkout)
+        nights = self._calc_nights(request.checkin, request.checkout)
+        lines = [
+            f"Montei um pacote completo pra *{dest_name}* com voo + hotel!",
+            f"Ida {ida} e volta {volta} ({nights} noites)",
+            f"Para {request.adults} adulto(s)",
+            "",
+        ]
+        hotels = result.get("hotels") or []
+        if hotels:
+            h = hotels[0]
+            lines.append(f"Hotel sugerido: *{h.get('name')}* {self._star_emoji(h.get('stars', 0))}")
+            if h.get("board"):
+                lines.append(f"   {h['board']}")
+            lines.append("")
+        lines += [
+            "Veja o pacote completo (voo + hotel) num link so:",
+            result.get("quote_url") or "",
+            "",
+            "Gostou? Posso te conectar com nosso setor de fechamentos pra finalizar tudo!",
+        ]
+        return "\n".join(lines)
 
     def _format_destination_not_found(self, destino: str) -> str:
         return (
