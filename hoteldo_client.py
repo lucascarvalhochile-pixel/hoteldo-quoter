@@ -18,6 +18,7 @@ Fluxo descoberto (Etapa 1):
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import date
 from pathlib import Path
@@ -37,6 +38,11 @@ from hoteldo_auth import TokenAuthMixin
 from hoteldo_quote import HotelDoQuoteError, QuoteMixin
 
 logger = logging.getLogger("hoteldo_quoter.client")
+
+# Ocupacao maxima por quarto na busca do HotelDo (grupo maior vira varios quartos)
+MAX_PAX_PER_ROOM = int(os.getenv("HOTELDO_MAX_PAX_PER_ROOM", "4"))
+# Idade usada quando a MARIA sabe que tem crianca mas nao sabe a idade
+DEFAULT_CHILD_AGE = int(os.getenv("HOTELDO_DEFAULT_CHILD_AGE", "8"))
 
 # Timeout para aguardar resultados de busca (hoteis podem demorar)
 SEARCH_RESULTS_TIMEOUT_MS = 45_000
@@ -542,13 +548,31 @@ class HotelDoClient(TokenAuthMixin, QuoteMixin):
 
         Para multiplos quartos, cada quarto eh separado por "!"
         """
-        ages = children_ages or []
+        # FIX GRUPOS (2026-11-04): antes repetia o grupo inteiro em cada quarto e
+        # mandava 10 adultos num quarto so ("/10"): o HotelDo rejeita e volta pra
+        # home ("Sem trip id na URL"). Agora divide em quartos de ate
+        # MAX_PAX_PER_ROOM pessoas, cada quarto com pelo menos 1 adulto, e
+        # completa idade de crianca que veio sem idade (senao a crianca sumia).
+        adults = max(1, int(adults or 1))
+        children = max(0, int(children or 0))
+        ages = [int(a) for a in (children_ages or []) if str(a).strip().isdigit()]
+        children = max(children, len(ages))
+        while len(ages) < children:
+            ages.append(DEFAULT_CHILD_AGE)
+        ages = ages[:children]
+        total = adults + children
+        n_rooms = max(int(rooms or 1), -(-total // MAX_PAX_PER_ROOM))
+        n_rooms = max(1, min(n_rooms, adults))
+
+        room_adults = [adults // n_rooms + (1 if i < adults % n_rooms else 0) for i in range(n_rooms)]
+        room_kids: list[list[int]] = [[] for _ in range(n_rooms)]
+        for age in ages:
+            i = min(range(n_rooms), key=lambda r: room_adults[r] + len(room_kids[r]))
+            room_kids[i].append(age)
 
         room_parts = []
-        for _ in range(rooms):
-            parts = [str(adults)]
-            for age in ages:
-                parts.append(str(age))
+        for i in range(n_rooms):
+            parts = [str(room_adults[i])] + [str(a) for a in room_kids[i]]
             room_parts.append("-".join(parts))
 
         return "!".join(room_parts)
