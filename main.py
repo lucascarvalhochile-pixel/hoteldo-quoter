@@ -8,7 +8,10 @@ Deploy: Railway
 Infra: HotelDo (Despegar/Decolar) via browser automation (Playwright)
 """
 
+import asyncio
 import logging
+import os
+import time
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any, Optional
@@ -62,10 +65,73 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("Login automatico falhou (sera tentado sob demanda): %s", exc)
 
+    # KEEPALIVE (05/11): a sessao do HotelDo expirava por inatividade e o re-login cai no
+    # reCAPTCHA. Agora uma task renova a sessao a cada N minutos numa aba separada.
+    _ka_task = asyncio.create_task(_session_keepalive())
+
     yield
+
+    _ka_task.cancel()
 
     logger.info("=== hoteldo-quoter encerrando ===")
     await hoteldo_client.stop()
+
+
+# ---------------------------------------------------------------------------
+# Keepalive da sessao HotelDo
+# ---------------------------------------------------------------------------
+
+_keepalive = {"last_ok": None, "last_check": None, "fails": 0, "interval_min": int(os.environ.get("KEEPALIVE_MINUTES", "10"))}
+
+
+async def _keepalive_once() -> bool:
+    """Renova a sessao numa aba separada (nao mexe na aba das cotacoes)."""
+    ctx = hoteldo_client._context
+    if not ctx:
+        return False
+    page = await ctx.new_page()
+    try:
+        await page.goto(settings.hoteldo_base_url, wait_until="domcontentloaded", timeout=settings.navigation_timeout_ms)
+        await page.wait_for_timeout(2000)
+        if "/login" in page.url or "agent-not-logged" in page.url:
+            return False
+        ok = await page.evaluate("""async () => { try { const r = await fetch('/socrates/api/current-user/status'); return r.ok; } catch { return false; } }""")
+        if not ok:
+            await page.goto(f"{settings.hoteldo_base_url}/socrates/auth/social", wait_until="domcontentloaded", timeout=settings.navigation_timeout_ms)
+            await page.wait_for_timeout(2000)
+            if "/login" in page.url:
+                return False
+            ok = await page.evaluate("""async () => { try { const r = await fetch('/socrates/api/current-user/status'); return r.ok; } catch { return false; } }""")
+        if ok:
+            await hoteldo_client._save_state()
+        return bool(ok)
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+async def _session_keepalive() -> None:
+    interval = max(3, _keepalive["interval_min"]) * 60
+    while True:
+        await asyncio.sleep(interval)
+        _keepalive["last_check"] = time.time()
+        try:
+            if not hoteldo_client._authenticated:
+                continue
+            if await _keepalive_once():
+                _keepalive["last_ok"] = time.time()
+                _keepalive["fails"] = 0
+                logger.info("KEEPALIVE: sessao HotelDo renovada")
+            else:
+                _keepalive["fails"] += 1
+                logger.warning("KEEPALIVE: sessao nao respondeu (%d)", _keepalive["fails"])
+                if _keepalive["fails"] >= 2:
+                    hoteldo_client._authenticated = False
+                    logger.error("KEEPALIVE: sessao HotelDo CAIU. Precisa de novo login + inject-cookies.")
+        except Exception as exc:
+            logger.warning("KEEPALIVE erro: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +221,10 @@ async def health_check():
     """
     health = await hoteldo_client.check_health()
     all_ok = all(health.values())
+    # KEEPALIVE: se a sessao marcada como autenticada nao renova ha muito tempo, nao confiar
+    if health.get("session_authenticated") and _keepalive["last_check"] and _keepalive["fails"] >= 2:
+        health["session_authenticated"] = False
+        all_ok = False
 
     return HealthResponse(
         status="healthy" if all_ok else "degraded",
@@ -460,6 +530,11 @@ TOKEN_LOGIN_SCRIPT = r"""
 async def token_script():
     """Retorna o script JS que gera tokens reCAPTCHA e dispara o token-login."""
     return {"script": TOKEN_LOGIN_SCRIPT}
+
+
+@app.get("/admin/keepalive")
+async def keepalive_status():
+    return {**_keepalive, "authenticated": hoteldo_client._authenticated}
 
 
 @app.get("/admin/debug-session")
