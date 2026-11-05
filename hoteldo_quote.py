@@ -685,17 +685,18 @@ class QuoteMixin:
             if mm:
                 f["cabin"] = mm.group(1).strip()
             # GRU \n Sao Paulo \n Duracao \n 4 h 29 m \n SCL \n Santiago \n Aeroporto X \n Aeroporto Y
-            mm = _re.search(
-                r"([A-Z]{3})\n([^\n]+)\nDura[cç][aã]o\n[^\n]+\n([A-Z]{3})\n([^\n]+)\n([^\n]*Aeroporto[^\n]*)\n([^\n]*Aeroporto[^\n]*)",
-                sec,
-            )
-            if mm:
-                f.update(from_city=mm.group(2).strip(), to_city=mm.group(4).strip(),
-                         from_airport=mm.group(5).strip(), to_airport=mm.group(6).strip())
-            else:
-                mm = _re.search(r"([A-Z]{3})\n([^\n]+)\nDura[cç][aã]o\n[^\n]+\n([A-Z]{3})\n([^\n]+)", sec)
-                if mm:
-                    f.update(from_city=mm.group(2).strip(), to_city=mm.group(4).strip())
+            # Segmentos (com escala a pagina lista varios blocos "XXX\nCidade\nDuracao\n..\nYYY\nCidade")
+            segs = _re.findall(r"([A-Z]{3})\n([^\n]+)\nDura[cç][aã]o\n[^\n]+\n([A-Z]{3})\n([^\n]+)", sec)
+            if segs:
+                f.update(from_code=segs[0][0], from_city=segs[0][1].strip(),
+                         to_code=segs[-1][2], to_city=segs[-1][3].strip(),
+                         segments=[{"from": a, "from_city": b.strip(), "to": c, "to_city": d.strip()} for a, b, c, d in segs])
+                if len(segs) > 1:
+                    f["via"] = ", ".join(x[2] + " (" + x[3].strip() + ")" for x in segs[:-1])
+                aps = _re.findall(r"([^\n]*Aeroporto[^\n]*)", sec)
+                if aps:
+                    f["from_airport"] = aps[0].strip()
+                    f["to_airport"] = aps[-1].strip()
             bi = sec.find("Bagagem")
             if bi >= 0:
                 bsec = sec[bi:bi + 600]
@@ -727,9 +728,16 @@ class QuoteMixin:
                 () => {
                     const txt = document.body.innerText || '';
                     const out = {};
-                    let m = txt.match(/Hospedagem selecionada\s*\n\s*([^\n]+)/);
-                    if (!m) m = txt.match(/Hospedagem\s*\n\s*Alterar hospedagem\s*\n\s*([^\n]+)/);
-                    if (m) out.hotel_name = m[1].trim();
+                    const BADGES = /^(all inclusive|caf[eé] da manh[aã]|buffet de caf[eé] da manh[aã]|oferta imbat[ií]vel|reserva flex[ií]vel|pague em parcelas|an[uú]ncio|resta apenas \d+|escolhido por casais|meia pens[aã]o|pens[aã]o completa|somente hospedagem|\d+(\.\d)?|muito bom|excelente|bom)$/i;
+                    const pick = (label) => {
+                        const i = txt.indexOf(label);
+                        if (i < 0) return null;
+                        const lines = txt.slice(i + label.length, i + label.length + 400).split('\n').map(s => s.trim()).filter(Boolean);
+                        for (const l of lines) { if (l === 'Alterar hospedagem') continue; if (!BADGES.test(l)) return l; }
+                        return null;
+                    };
+                    let name = pick('Hospedagem selecionada') || pick('Hospedagem\nAlterar hospedagem') || pick('Hospedagem');
+                    if (name) out.hotel_name = name;
                     m = txt.match(/Pre[cç]o final por pessoa\s*\n?\s*(?:\(i\)\s*)?R\$\s*([\d\.]+)/);
                     if (m) out.price_per_person = m[1];
                     m = txt.match(/Final\s+(\d+)\s+pessoas?\s*R\$\s*([\d\.]+)/);

@@ -544,7 +544,7 @@ class MariaBridge:
             extra.append(leg["airline"])
         st = self._stops_label(leg.get("stops", ""))
         if st:
-            extra.append(st)
+            extra.append(st + (f" via {leg['via']}" if leg.get("via") and st != "voo direto" else ""))
         if leg.get("duration"):
             extra.append(leg["duration"].replace(" h ", "h").replace(" m", "min"))
         if extra:
@@ -631,10 +631,16 @@ class MariaBridge:
         ida = self._format_date_br(request.checkin)
         volta = self._format_date_br(request.checkout)
         nights = self._calc_nights(request.checkin, request.checkout)
-        pax = request.adults + (request.children or 0)
+        rooms = max(1, int(request.rooms or 1))
+        pax = request.adults * rooms + (request.children or 0)
         h = result.get("selected_hotel") or ((result.get("hotels") or [None])[0]) or {}
         summary = result.get("summary") or {}
         details = result.get("details") or {}
+        _badges = ("all inclusive", "cafe da manha", "café da manhã", "oferta imbatível", "reserva flexível", "pague em parcelas")
+        if (not h or not h.get("name") or (h.get("name") or "").strip().lower() in _badges) and details.get("hotel_name"):
+            dn = details["hotel_name"].strip()
+            match = next((x for x in (result.get("hotels") or []) if (x.get("name") or "").strip().lower() == dn.lower()), None)
+            h = match or {**(h or {}), "name": dn, "address": details.get("hotel_address", "")}
         flights = details.get("flights") or []
         f_out = next((f for f in flights if f.get("leg") == "out"), None)
         f_back = next((f for f in flights if f.get("leg") == "back"), None)
@@ -660,10 +666,12 @@ class MariaBridge:
             if bl:
                 lines.append(bl)
             lines.append("")
-        if h:
+        if h and h.get("name"):
             stars = self._star_emoji(h.get("stars", 0) or 0)
             lines.append("🏨 *HOTEL*")
             lines.append(f"*{h.get('name')}*" + (f" {stars}" if stars else ""))
+            if rooms > 1:
+                lines.append(f"🛏️ {rooms} quartos")
             loc = h.get("zone") or h.get("region") or ""
             addr = h.get("address") or details.get("hotel_address") or ""
             if loc and loc.lower() not in addr.lower():
