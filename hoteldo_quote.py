@@ -223,6 +223,10 @@ class QuoteMixin:
             m = TRIP_ID_RE.search(self._page.url)
             if m:
                 return m.group(1)
+            # HotelDo nao monta pacote fechado (ex.: GRU->San Andres, so com conexao) e manda
+            # pra pagina de alternativas. Sinaliza pro bridge cotar voo e hotel separados.
+            if "/trip/start/alternatives" in self._page.url:
+                raise HotelDoQuoteError("PACKAGE_UNAVAILABLE: HotelDo nao oferece pacote fechado pra essa rota/data")
             await self._page.wait_for_timeout(1000)
         raise HotelDoQuoteError(f"Sem trip id na URL apos {timeout_s}s: {self._page.url[:200]}")
 

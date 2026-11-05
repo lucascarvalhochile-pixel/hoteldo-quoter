@@ -477,6 +477,9 @@ class MariaBridge:
                 children_ages=request.children_ages, rooms=request.rooms,
             )
         except Exception as exc:
+            if "PACKAGE_UNAVAILABLE" in str(exc):
+                logger.info("Pacote indisponivel pra %s; cotando voo e hotel separados", dest_name)
+                return await self._generate_split_quote(request, destination_id, dest_name)
             logger.error("Erro na cotacao de pacote: %s", exc, exc_info=True)
             return MariaQuoteResponse(
                 success=False, product="package", message=self._format_search_error(),
@@ -487,6 +490,37 @@ class MariaBridge:
             message=self._format_package_message(request, dest_name, result),
             quote_url=result.get("quote_url"), hotels_found=len(result.get("hotels") or []),
             destination_id=destination_id, destination_name=dest_name, raw_results=result,
+        )
+
+    async def _generate_split_quote(
+        self, request: MariaQuoteRequest, destination_id: str, dest_name: str
+    ) -> MariaQuoteResponse:
+        """Pacote fechado indisponivel: voo (1 link) + hotel (1 link) na mesma mensagem."""
+        flight = await self._generate_flight_quote(request, destination_id, dest_name)
+        hotel_req = request.model_copy(update={"product": "hotel"}) if hasattr(request, "model_copy") else request.copy(update={"product": "hotel"})
+        hotel = await self.generate_quote(hotel_req)
+        if not flight.success and not hotel.success:
+            return MariaQuoteResponse(
+                success=False, product="package", message=self._format_search_error(),
+                error=f"split falhou: voo={flight.error} hotel={hotel.error}",
+                destination_id=destination_id, destination_name=dest_name,
+            )
+        parts = [f"Pra *{dest_name}* o sistema não fecha voo + hotel num pacote só (tem conexão no caminho), "
+                 f"então montei os dois separados, cada um com seu link:"]
+        if flight.success:
+            parts.append("\n✈️ *PASSAGEM*\n" + flight.message.split("Gostou?")[0].replace("Montei sua passagem pra *" + dest_name + "*! ✈️", "").strip())
+        else:
+            parts.append("\n✈️ *PASSAGEM*: não achei voo automático pra essas datas, vou pedir pro time cotar.")
+        if hotel.success:
+            parts.append("\n🏨 *HOTEL*\n" + hotel.message.split("Gostou")[0].replace("Encontrei otimas opcoes de hotel em *" + dest_name + "*!", "").strip())
+        else:
+            parts.append("\n🏨 *HOTEL*: sem disponibilidade automática pra essas datas.")
+        parts.append("\nGostou? Se quiser ajustar algo (datas, hotel, cidade de saída) ou ver outro destino, me diz que eu monto outra opção. E quando quiser garantir a reserva, é só me avisar! 😊")
+        return MariaQuoteResponse(
+            success=True, product="package", message="\n".join(parts),
+            quote_url=flight.quote_url or hotel.quote_url, hotels_found=hotel.hotels_found or 0,
+            destination_id=destination_id, destination_name=dest_name,
+            raw_results={"flight": flight.raw_results, "hotel": hotel.raw_results, "split": True},
         )
 
     # -------------------------------------------------------------------------
