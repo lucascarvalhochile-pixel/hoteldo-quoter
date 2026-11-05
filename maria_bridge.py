@@ -32,9 +32,6 @@ from hoteldo_client import HotelDoClient
 
 logger = logging.getLogger("hoteldo_quoter.maria_bridge")
 
-# Voo/pacote online: limite de passageiros por reserva
-MAX_ONLINE_AIR_PAX = 9
-
 
 # ---------------------------------------------------------------------------
 # Mapeamento de destinos para IDs do HotelDo
@@ -127,6 +124,10 @@ DESTINATION_IATA: dict[str, str] = {
 
 # Origem (cidade/aeroporto de saida do cliente) -> IATA
 ORIGIN_IATA: dict[str, str] = {
+    "joinville": "JOI", "navegantes": "NVT", "campo grande": "CGR", "vitoria": "VIX", "belem": "BEL",
+    "natal": "NAT", "salvador": "SSA", "londrina": "LDB", "maringa": "MGF", "ribeirao preto": "RAO",
+    "uberlandia": "UDI", "foz do iguacu": "IGU", "porto seguro": "BPS", "cuiaba": "CGB", "goiania": "GYN",
+    "sao luis": "SLZ", "teresina": "THE", "manaus": "MAO", "aracaju": "AJU", "joao pessoa": "JPA", "maceio": "MCZ",
     "sao paulo": "GRU", "são paulo": "GRU", "sp": "GRU", "guarulhos": "GRU", "gru": "GRU",
     "congonhas": "CGH", "campinas": "VCP", "viracopos": "VCP",
     "rio de janeiro": "GIG", "rio": "GIG", "galeao": "GIG", "galeão": "GIG", "gig": "GIG",
@@ -161,10 +162,10 @@ class MariaQuoteRequest(BaseModel):
     destino: str = Field(..., description="Nome do destino (ex: Santiago, Buenos Aires)")
     checkin: str = Field(..., description="Data de checkin no formato YYYY-MM-DD ou DD/MM/YYYY")
     checkout: str = Field(..., description="Data de checkout no formato YYYY-MM-DD ou DD/MM/YYYY")
-    adults: int = Field(default=2, ge=1, le=40, description="Numero de adultos")
-    children: int = Field(default=0, ge=0, le=15, description="Numero de criancas")
+    adults: int = Field(default=2, ge=1, le=10, description="Numero de adultos")
+    children: int = Field(default=0, ge=0, le=6, description="Numero de criancas")
     children_ages: list[int] = Field(default_factory=list, description="Idades das criancas")
-    rooms: int = Field(default=1, ge=1, le=12, description="Numero de quartos")
+    rooms: int = Field(default=1, ge=1, le=5, description="Numero de quartos")
 
     # O que o cliente pediu: hotel | flight | package (voo + hotel, link unico)
     product: str = Field(default="hotel", description="hotel | flight | package")
@@ -295,18 +296,6 @@ class MariaBridge:
         dest_name = DESTINATION_NAMES.get(destination_id, request.destino)
 
         product = (request.product or "hotel").strip().lower()
-        # FIX GRUPOS (2026-11-04): voo/pacote online aceita no maximo 9 passageiros
-        # por reserva. Grupo maior: cota a hospedagem e a parte aerea fica com o
-        # especialista (tarifa de grupo). Antes travava 90s e falhava sempre.
-        _pax = int(request.adults or 0) + int(request.children or 0) + int(request.infants or 0)
-        group_note = ""
-        if _pax > MAX_ONLINE_AIR_PAX and product in ("voo", "passagem", "flight", "flights", "pacote", "package", "both", "voo+hotel"):
-            logger.info("Grupo de %d pessoas: %s vira hotel (aereo de grupo fica com o especialista)", _pax, product)
-            group_note = (
-                f"Como vocês são {_pax} pessoas, a passagem aérea entra como tarifa de grupo "
-                "e o nosso especialista cota à parte. Aqui vai a hospedagem:"
-            )
-            product = "hotel"
         if product in ("voo", "passagem", "flight", "flights"):
             return await self._generate_flight_quote(request, destination_id, dest_name)
         if product in ("pacote", "package", "both", "voo+hotel"):
@@ -374,13 +363,12 @@ class MariaBridge:
             )
 
         # 4. Formatar resposta
-        _msg = self._format_results_message(request, hotels, dest_name, quote_url)
-        if group_note:
-            _msg = group_note + "\n\n" + _msg
         return MariaQuoteResponse(
             success=True,
             product="hotel",
-            message=_msg,
+            message=self._format_results_message(
+                request, hotels, dest_name, quote_url
+            ),
             quote_url=quote_url,
             hotels_found=len(hotels),
             destination_id=destination_id,
@@ -746,7 +734,7 @@ class MariaBridge:
         lines = [
             f"Encontrei otimas opcoes de hotel em *{dest_name}*!",
             f"Datas: {checkin} a {checkout} ({nights} noites)",
-            self._pax_line(request),
+            f"Para {request.adults} adulto(s)",
             "",
         ]
 
@@ -793,23 +781,6 @@ class MariaBridge:
             )
 
         return "\n".join(lines)
-
-    @staticmethod
-    def _pax_line(request: "MariaQuoteRequest") -> str:
-        a = int(request.adults or 0)
-        c = max(int(request.children or 0), len(request.children_ages or []))
-        txt = f"Para {a} adulto(s)"
-        if c:
-            txt += f" e {c} criança(s)"
-        total = a + c
-        try:
-            from hoteldo_client import MAX_PAX_PER_ROOM
-            rooms = max(int(request.rooms or 1), -(-total // MAX_PAX_PER_ROOM))
-        except Exception:
-            rooms = int(request.rooms or 1)
-        if rooms > 1:
-            txt += f", em {rooms} quartos"
-        return txt
 
     @staticmethod
     def _star_emoji(stars: int) -> str:
