@@ -632,7 +632,7 @@ class MariaBridge:
         volta = self._format_date_br(request.checkout)
         nights = self._calc_nights(request.checkin, request.checkout)
         rooms = max(1, int(request.rooms or 1))
-        pax = request.adults * rooms + (request.children or 0)
+        pax = request.adults + (request.children or 0)
         h = result.get("selected_hotel") or ((result.get("hotels") or [None])[0]) or {}
         summary = result.get("summary") or {}
         details = result.get("details") or {}

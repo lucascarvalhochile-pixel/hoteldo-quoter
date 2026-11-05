@@ -543,7 +543,13 @@ class HotelDoClient(TokenAuthMixin, QuoteMixin):
         Para multiplos quartos, cada quarto eh separado por "!"
         """
         ages = list(children_ages or [])
-        rooms = max(1, int(rooms or 1))
+        rooms = max(1, min(4, int(rooms or 1)))
+        # adults = TOTAL de adultos quando rooms > 1: divide o mais igual possivel (10 em 4 = 3,3,2,2)
+        if rooms > 1:
+            base, extra = divmod(int(adults), rooms)
+            adults_per_room = [base + (1 if i < extra else 0) for i in range(rooms)]
+        else:
+            adults_per_room = [int(adults)]
         # FIX 05/11: criancas distribuidas entre os quartos (antes cada quarto repetia TODAS as
         # idades: 2 quartos x 2 criancas virava 4 criancas). Maximo 2 criancas por quarto.
         per_room = [[] for _ in range(rooms)]
@@ -551,7 +557,7 @@ class HotelDoClient(TokenAuthMixin, QuoteMixin):
             per_room[i % rooms].append(str(age))
         room_parts = []
         for i in range(rooms):
-            parts = [str(adults)] + per_room[i]
+            parts = [str(max(1, adults_per_room[i]))] + per_room[i]
             room_parts.append("-".join(parts))
         return "!".join(room_parts)
 
