@@ -68,13 +68,89 @@ async def lifespan(app: FastAPI):
     # KEEPALIVE (05/11): a sessao do HotelDo expirava por inatividade e o re-login cai no
     # reCAPTCHA. Agora uma task renova a sessao a cada N minutos numa aba separada.
     _ka_task = asyncio.create_task(_session_keepalive())
+    _cn_task = asyncio.create_task(_canary_loop())
 
     yield
 
     _ka_task.cancel()
+    _cn_task.cancel()
 
     logger.info("=== hoteldo-quoter encerrando ===")
     await hoteldo_client.stop()
+
+
+# ---------------------------------------------------------------------------
+# FILA (06/11, banca): o quoter tem UM navegador e UMA aba. Duas cotacoes ao mesmo tempo
+# disputam a mesma pagina e as duas quebram. Lock = uma cotacao por vez; as outras esperam.
+# ---------------------------------------------------------------------------
+_quote_lock = asyncio.Lock()
+_quote_stats = {"in_progress": 0, "waiting": 0, "done": 0, "failed": 0, "last_duration_s": None}
+
+
+# ---------------------------------------------------------------------------
+# CANARY (06/11, Lucas): roda uma cotacao REAL de tempos em tempos pra descobrir na hora
+# quando o HotelDo muda alguma coisa (foi o caso dos ids PV... em 06/11). Resultado vai no
+# /health (canary_ok) e a MARIA alerta o Lucas no WhatsApp quando falha.
+# ---------------------------------------------------------------------------
+_canary = {"last_run": None, "last_ok": None, "last_fail": None, "ok": None, "error": "", "product": "",
+           "duration_s": None, "interval_min": int(os.environ.get("CANARY_MINUTES", "60")),
+           "package_every_h": int(os.environ.get("CANARY_PACKAGE_HOURS", "6")), "consecutive_fails": 0,
+           "last_package_run": None, "url": ""}
+
+
+async def _canary_once(product: str) -> None:
+    from datetime import timedelta
+    import time as _t
+    ci = date.today() + timedelta(days=45)
+    co = ci + timedelta(days=3)
+    req = MariaQuoteRequest(destino="santiago", checkin=ci.isoformat(), checkout=co.isoformat(), adults=2,
+                            product=product, origem="Sao Paulo" if product != "hotel" else None,
+                            client_name="Canary LC (teste automatico)")
+    t0 = _t.time()
+    _canary["last_run"] = t0
+    _canary["product"] = product
+    try:
+        async with _quote_lock:
+            resp = await maria_bridge.generate_quote(req)
+        dur = round(_t.time() - t0, 1)
+        _canary["duration_s"] = dur
+        if resp.success and resp.quote_url:
+            _canary.update({"ok": True, "last_ok": _t.time(), "error": "", "consecutive_fails": 0, "url": resp.quote_url})
+            logger.info("CANARY OK (%s) em %ss: %s", product, dur, resp.quote_url)
+        else:
+            _canary.update({"ok": False, "last_fail": _t.time(), "error": (resp.error or resp.message or "sem link")[:300]})
+            _canary["consecutive_fails"] += 1
+            logger.error("CANARY FALHOU (%s): %s", product, _canary["error"])
+    except Exception as exc:
+        _canary.update({"ok": False, "last_fail": _t.time(), "error": str(exc)[:300], "duration_s": round(_t.time() - t0, 1)})
+        _canary["consecutive_fails"] += 1
+        logger.error("CANARY ERRO (%s): %s", product, exc)
+    if product == "package":
+        _canary["last_package_run"] = _t.time()
+
+
+async def _canary_loop() -> None:
+    import time as _t
+    await asyncio.sleep(120)
+    while True:
+        try:
+            if hoteldo_client._authenticated:
+                _prod = "hotel"
+                _lp = _canary.get("last_package_run") or 0
+                if (_t.time() - _lp) > _canary["package_every_h"] * 3600:
+                    _prod = "package"
+                await _canary_once(_prod)
+                # falhou: tenta renovar sessao e repete UMA vez antes de marcar quebrado
+                if _canary["ok"] is False and _canary["consecutive_fails"] == 1:
+                    try:
+                        await _keepalive_once()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(30)
+                    await _canary_once(_prod)
+        except Exception as exc:
+            logger.warning("CANARY loop erro: %s", exc)
+        await asyncio.sleep(max(10, _canary["interval_min"]) * 60)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +289,7 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 async def health_check():
     """
     Health check do servico.
@@ -226,12 +302,19 @@ async def health_check():
         health["session_authenticated"] = False
         all_ok = False
 
-    return HealthResponse(
-        status="healthy" if all_ok else "degraded",
-        browser_running=health["browser_running"],
-        session_authenticated=health["session_authenticated"],
-        suggestions_api=health["suggestions_api"],
-    )
+    return JSONResponse({
+        "status": "healthy" if (all_ok and _canary.get("ok") is not False) else "degraded",
+        "service": "hoteldo-quoter",
+        "version": "0.1.0",
+        "browser_running": health["browser_running"],
+        "session_authenticated": health["session_authenticated"],
+        "suggestions_api": health["suggestions_api"],
+        "canary_ok": _canary.get("ok"),
+        "canary_error": _canary.get("error"),
+        "canary_last_ok": _canary.get("last_ok"),
+        "canary_product": _canary.get("product"),
+        "queue": _quote_stats,
+    })
 
 
 @app.post("/quote", response_model=MariaQuoteResponse)
@@ -269,12 +352,25 @@ async def create_quote(request: QuoteRequest):
         conversation_id=request.conversation_id,
     )
 
+    import time as _t
+    _quote_stats["waiting"] += 1
+    _t0 = _t.time()
     try:
-        response = await maria_bridge.generate_quote(maria_request)
+        async with _quote_lock:
+            _quote_stats["waiting"] -= 1
+            _quote_stats["in_progress"] = 1
+            if _t.time() - _t0 > 2:
+                logger.info("FILA: cotacao esperou %.0fs na fila", _t.time() - _t0)
+            response = await maria_bridge.generate_quote(maria_request)
+        _quote_stats["done"] += 1
+        _quote_stats["last_duration_s"] = round(_t.time() - _t0, 1)
         return response
     except Exception as exc:
+        _quote_stats["failed"] += 1
         logger.error("Erro ao gerar cotacao: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erro interno: {exc}")
+    finally:
+        _quote_stats["in_progress"] = 0
 
 
 @app.post("/search")
@@ -530,6 +626,17 @@ TOKEN_LOGIN_SCRIPT = r"""
 async def token_script():
     """Retorna o script JS que gera tokens reCAPTCHA e dispara o token-login."""
     return {"script": TOKEN_LOGIN_SCRIPT}
+
+
+@app.get("/admin/canary")
+async def canary_status():
+    return _canary
+
+
+@app.post("/admin/canary/run")
+async def canary_run(product: str = "hotel"):
+    await _canary_once(product if product in ("hotel", "flight", "package") else "hotel")
+    return _canary
 
 
 @app.get("/admin/keepalive")
