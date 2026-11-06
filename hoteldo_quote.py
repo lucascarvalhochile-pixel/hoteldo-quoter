@@ -29,7 +29,7 @@ from config import settings
 
 logger = logging.getLogger("hoteldo_quoter.quote")
 
-TRIP_ID_RE = re.compile(r"(PR[a-f0-9]{30,})")
+TRIP_ID_RE = re.compile(r"((?:PR|PV|P[A-Z])[a-f0-9]{30,})")  # 06/11: HotelDo passou a emitir ids PV...
 
 
 class HotelDoQuoteError(Exception):
