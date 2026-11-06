@@ -53,6 +53,12 @@ DESTINATION_MAP: dict[str, str] = {
     "bariloche": "CIT_901",
     "san carlos de bariloche": "CIT_901",
     "mendoza": "CIT_4451",
+    "ushuaia": "CIT_7781",
+    "el calafate": "CIT_2346",
+    "calafate": "CIT_2346",
+    "puerto natales": "CIT_4953",
+    "torres del paine": "CIT_4953",
+    "curacao": "CIT_1573",
     "argentina": "CIT_982",
 
     # --- Peru ---
@@ -99,6 +105,7 @@ DESTINATION_NAMES: dict[str, str] = {
     "CIT_394": "Atacama",
     "CIT_982": "Buenos Aires",
     "CIT_901": "Bariloche",
+    "CIT_7781": "Ushuaia", "CIT_2346": "El Calafate", "CIT_4953": "Puerto Natales", "CIT_1573": "Curaçao",
     "CIT_4451": "Mendoza",
     "CIT_4088": "Lima",
     "CIT_1579": "Cusco",
@@ -120,6 +127,7 @@ DESTINATION_IATA: dict[str, str] = {
     "CIT_4451": "MDZ", "CIT_4088": "LIM", "CIT_1579": "CUZ", "CIT_854": "BOG",
     "CIT_1535": "CTG", "CIT_6350": "ADZ", "CIT_1569": "CUN", "CIT_4475": "MEX",
     "CIT_5963": "PUJ", "CIT_5419": "MCO", "CIT_4625": "MIA", "CIT_4685": "MVD",
+    "CIT_7781": "USH", "CIT_2346": "FTE", "CIT_4953": "PUQ", "CIT_1573": "CUR",
 }
 
 # Origem (cidade/aeroporto de saida do cliente) -> IATA
