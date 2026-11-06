@@ -313,6 +313,8 @@ async def health_check():
         "canary_error": _canary.get("error"),
         "canary_last_ok": _canary.get("last_ok"),
         "canary_product": _canary.get("product"),
+        "session_since": _session_meta.get("since"),
+        "session_age_h": round((time.time() - _session_meta["since"]) / 3600, 1) if _session_meta.get("since") else None,
         "queue": _quote_stats,
     })
 
@@ -367,6 +369,9 @@ async def create_quote(request: QuoteRequest):
         return response
     except Exception as exc:
         _quote_stats["failed"] += 1
+        if "Login" in str(exc) or "autentic" in str(exc).lower() or "AuthError" in type(exc).__name__:
+            _canary.update({"ok": False, "error": "sessao do HotelDO expirou (login/captcha)", "last_fail": time.time()})
+            hoteldo_client._authenticated = False
         logger.error("Erro ao gerar cotacao: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erro interno: {exc}")
     finally:
@@ -532,6 +537,9 @@ async def inject_cookies(request: InjectCookiesRequest):
         raise HTTPException(status_code=500, detail=f"Erro: {exc}")
 
     if success:
+        _session_meta["since"] = time.time()
+        _canary["consecutive_fails"] = 0
+        _keepalive["fails"] = 0
         return {
             "status": "ok",
             "message": "Cookies injetados — sessao autenticada!",
@@ -626,6 +634,45 @@ TOKEN_LOGIN_SCRIPT = r"""
 async def token_script():
     """Retorna o script JS que gera tokens reCAPTCHA e dispara o token-login."""
     return {"script": TOKEN_LOGIN_SCRIPT}
+
+
+_session_meta = {"since": None}
+
+BOOKMARKLET_JS = (
+    "javascript:(async()=>{try{const raw=document.cookie.split(';').map(c=>c.trim()).filter(Boolean)"
+    ".map(c=>{const i=c.indexOf('=');return [c.slice(0,i),c.slice(i+1)]});"
+    "const doms=['.e-agencias.com','.pt-hoteldo.e-agencias.com','pt-hoteldo.e-agencias.com',"
+    "'ag00124871-hoteldo.e-agencias.com','.ag00124871-hoteldo.e-agencias.com'];const cs=[];"
+    "for(const [n,v] of raw)for(const d of doms)cs.push({name:n,value:v,domain:d,path:'/',secure:true,sameSite:'Lax'});"
+    "const r=await fetch('https://hoteldo-quoter-production.up.railway.app/admin/inject-cookies',"
+    "{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookies:cs,password:'%s'})});"
+    "const j=await r.json();alert(j.authenticated?'HotelDO conectado na Maria ✅':'Nao autenticou: '+j.message);}"
+    "catch(e){alert('Erro: '+e)}})();"
+)
+
+
+@app.get("/admin/login-helper", response_class=__import__("fastapi.responses", fromlist=["HTMLResponse"]).HTMLResponse)
+async def login_helper(password: str = ""):
+    """Pagina com o botao (bookmarklet) que a equipe arrasta pra barra de favoritos.
+    Depois de logar no HotelDO, clica no favorito e a sessao vai pro quoter. Sem Claude no meio."""
+    expected_pw = os.environ.get("ADMIN_PASSWORD", "lcviagens2024")
+    if password != expected_pw:
+        return "<h3>Senha incorreta</h3>"
+    bm = BOOKMARKLET_JS % expected_pw
+    return f"""<!doctype html><html lang=pt-br><meta charset=utf-8><title>HotelDO x Maria</title>
+<body style="font-family:Sora,Figtree,Arial;max-width:720px;margin:40px auto;color:#001228;line-height:1.5">
+<h2 style="color:#0100FE">Reconectar o HotelDO na Maria</h2>
+<p>A sessao do HotelDO vence a cada 24 horas. Quando a Maria avisar no WhatsApp, faca isto (1 minuto):</p>
+<ol>
+<li>Arraste o botao abaixo pra sua <b>barra de favoritos</b> do Chrome (so uma vez).</li>
+<li>Entre no HotelDO normalmente: <a href="https://ag00124871-hoteldo.e-agencias.com/" target=_blank>ag00124871-hoteldo.e-agencias.com</a> (login e captcha).</li>
+<li>Com o HotelDO aberto e logado, clique no favorito. Vai aparecer "HotelDO conectado na Maria".</li>
+</ol>
+<p><a href="{bm}" style="display:inline-block;background:#0100FE;color:#fff;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:600">Conectar HotelDO na Maria</a>
+&nbsp; <span style="color:#555">(arraste este botao pra barra de favoritos)</span></p>
+<p style="color:#555;font-size:14px">Status agora: <span id=st>carregando...</span></p>
+<script>fetch('/health').then(r=>r.json()).then(j=>{{document.getElementById('st').textContent=(j.session_authenticated?'conectado':'DESCONECTADO')+' | ultimo teste automatico: '+(j.canary_ok===true?'ok':(j.canary_ok===false?'falhou':'ainda nao rodou'))}})</script>
+</body></html>"""
 
 
 @app.get("/admin/canary")
